@@ -120,13 +120,19 @@ class Dispatcher:
         if cache_key in self._impl_cache:
             return self._impl_cache[cache_key]
 
-        if manifest.sandbox and manifest.sandbox.enabled:
+        # Per-function override wins; otherwise fall back to agent-level setting.
+        agent_sandboxed = bool(manifest.sandbox and manifest.sandbox.enabled)
+        sandboxed = (
+            fn.sandbox_override if fn.sandbox_override is not None else agent_sandboxed
+        )
+        if sandboxed:
             from .sandbox import make_sandboxed_python_impl, make_sandboxed_command_impl
+            cfg = manifest.sandbox or __import__("core.sandbox", fromlist=["SandboxConfig"]).SandboxConfig(enabled=True)
             garden_root = manifest.folder.resolve().parent.parent
             if fn.command:
-                impl = make_sandboxed_command_impl(garden_root, manifest, fn, manifest.sandbox)
+                impl = make_sandboxed_command_impl(garden_root, manifest, fn, cfg)
             else:
-                impl = make_sandboxed_python_impl(garden_root, manifest, fn, manifest.sandbox)
+                impl = make_sandboxed_python_impl(garden_root, manifest, fn, cfg)
         elif fn.command:
             impl = self._make_command_impl(manifest, fn)
         else:
@@ -205,14 +211,16 @@ class Dispatcher:
         try:
             self.carry.assert_(
                 "garden.run",
-                id=run_id,
-                agent=manifest.name,
-                function=fn.name,
-                params=params,
-                parent_run=parent_run_id or "",
-                scope=scope or "",
-                status="running",
-                started_at=started_at,
+                **{
+                    "id": run_id,
+                    "agent": manifest.name,
+                    "function": fn.name,
+                    "params": params,
+                    "parent-run": parent_run_id or "",
+                    "scope": scope or "",
+                    "status": "running",
+                    "started-at": started_at,
+                },
             )
         except CarryError as e:
             if self.log:
@@ -230,7 +238,7 @@ class Dispatcher:
         fields: dict[str, Any] = {
             "id": run_id,
             "status": status,
-            "ended_at": time.time(),
+            "ended-at": time.time(),
             "duration": duration,
         }
         if result is not None:

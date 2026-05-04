@@ -125,6 +125,12 @@ def build_bwrap_argv(
         if Path(lib).exists():
             argv += ["--ro-bind", lib, lib]
 
+    # /run is needed for DNS on systemd-resolved hosts (/etc/resolv.conf
+    # symlinks into /run/systemd/resolve/) and for any service sockets the
+    # sandboxed code talks to. Read-only is fine; we're not writing pid files.
+    if Path("/run").exists():
+        argv += ["--ro-bind", "/run", "/run"]
+
     # Garden runtime + this agent only
     argv += [
         "--ro-bind", str(garden_root / "core"), str(garden_root / "core"),
@@ -186,9 +192,10 @@ def make_sandboxed_python_impl(
     impl_path = (manifest.folder / impl_path_part).resolve()
 
     scratch_dir = garden_root / "data" / "sandbox" / manifest.name
+    agent_folder_abs = manifest.folder.resolve()
 
     def impl(params: dict, ctx) -> Any:
-        bwrap_argv = build_bwrap_argv(garden_root, manifest.folder, scratch_dir, cfg)
+        bwrap_argv = build_bwrap_argv(garden_root, agent_folder_abs, scratch_dir, cfg)
         cmd = bwrap_argv + [
             sys.executable,
             "-m", "core.sandbox",
@@ -234,9 +241,10 @@ def make_sandboxed_command_impl(
     assert fn.command is not None
     user_cmd = list(fn.command)
     scratch_dir = garden_root / "data" / "sandbox" / manifest.name
+    agent_folder_abs = manifest.folder.resolve()
 
     def impl(params: dict, ctx) -> Any:
-        bwrap_argv = build_bwrap_argv(garden_root, manifest.folder, scratch_dir, cfg)
+        bwrap_argv = build_bwrap_argv(garden_root, agent_folder_abs, scratch_dir, cfg)
         payload = json.dumps({
             "params": params,
             "ctx": {

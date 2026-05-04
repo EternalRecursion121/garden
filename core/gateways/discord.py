@@ -27,24 +27,22 @@ Discord replays events on RESUME / reconnect. The gateway keeps a TTL
 cache of seen message_ids and drops repeats — without this we'd dispatch
 each replayed message a second time.
 
-Outbound: a service, not return-handling
-----------------------------------------
-The gateway registers a `DiscordService` on `dispatcher.services["discord"]`.
-Functions that want to emit Discord messages do so explicitly:
-
-    def run(params, ctx):
-        d = ctx.service("discord")
-        if d:
-            d.send(channel_id=params["channel_id"], text="hello")
-        return {"posted": True}
-
+Outbound: two paths
+-------------------
 Subscription is purely an *input* contract. A function that subscribes to a
-channel is not obligated to output to it. Functions that never receive a
-Discord event (e.g. a cron handler) can still call `ctx.service("discord")`
-to send messages.
+channel is not obligated to output to it. Two ways to emit:
 
-Function return values are not inspected by the gateway. They flow through
-the normal carry-recorded run result.
+1. **Return a `reply`/`replies`/`silent` dict** from a gateway-dispatched
+   function. The gateway prefixes with `**[<agent>]**` and posts to the
+   originating channel. Returning `{"silent": true}` (or returning anything
+   without a reply field) means "I saw it but I'm not responding." This is
+   the only outbound path available to sandboxed functions, since
+   `ctx.service(...)` returns None across process boundaries.
+
+2. **Call `ctx.service("discord")`** for proactive sends from any function
+   (cron, in-process, etc.). Returns None if the gateway isn't running.
+   Sandboxed functions can't use this — `ctx.service(...)` returns None
+   inside the sandbox.
 
 Inbound params
 --------------
@@ -241,21 +239,45 @@ class DiscordGateway:
             f"channel {channel_id} -> "
             + ", ".join(q for q, _ in subs)
         )
-        await self._dispatch_all(subs, params)
+        await self._dispatch_all(subs, params, message.channel)
 
-    async def _dispatch_all(self, subs, params):
+    async def _dispatch_all(self, subs, params, channel):
+        """Dispatch every subscriber in parallel. Each may return a dict; if
+        it has a `reply` field, post it to the channel prefixed with the
+        agent's name. Sandboxed functions can't reach `ctx.service('discord')`
+        from another process, so this return-protocol is the only outbound
+        path available to them. Unsandboxed functions can use either."""
         loop = asyncio.get_running_loop()
 
         def call_one(qualified: str):
             try:
-                self.dispatcher.call(qualified, params=params)
+                return qualified, self.dispatcher.call(qualified, params=params)
             except Exception as e:
                 self._log(f"{qualified} raised: {e}")
+                return qualified, None
 
         with ThreadPoolExecutor(max_workers=min(self.max_parallel, len(subs))) as ex:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *(loop.run_in_executor(ex, call_one, qualified) for qualified, _ in subs)
             )
+
+        for qualified, result in results:
+            if not isinstance(result, dict) or result.get("silent"):
+                continue
+            agent_name = qualified.partition(".")[0]
+            replies: list[str] = []
+            if isinstance(result.get("reply"), str):
+                replies.append(result["reply"])
+            replies.extend(
+                r for r in (result.get("replies") or []) if isinstance(r, str)
+            )
+            for text in replies:
+                if not text.strip():
+                    continue
+                try:
+                    await channel.send(f"**[{agent_name}]** {text}")
+                except Exception as e:
+                    self._log(f"channel.send failed: {e}")
 
     # entrypoint ---------------------------------------------------------
 

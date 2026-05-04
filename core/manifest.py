@@ -22,6 +22,7 @@ class FunctionDef:
     params: dict[str, str] = field(default_factory=dict)
     schedule: str | None = None          # cron string
     channels: list[str] = field(default_factory=list)  # discord channel IDs (incl. DM channels)
+    sandbox_override: bool | None = None  # None = use agent default; bool = override
 
 
 @dataclass
@@ -52,6 +53,7 @@ class AgentManifest:
                 params=entry.get("params", {}),
                 schedule=entry.get("schedule"),
                 channels=[str(c) for c in entry.get("channels", [])],
+                sandbox_override=entry.get("sandbox"),
             )
             if not fn.impl and not fn.command:
                 raise ValueError(
