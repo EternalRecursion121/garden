@@ -10,6 +10,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .sandbox import SandboxConfig
+
 
 @dataclass
 class FunctionDef:
@@ -28,6 +30,7 @@ class AgentManifest:
     folder: Path
     description: str = ""
     functions: dict[str, FunctionDef] = field(default_factory=dict)
+    sandbox: SandboxConfig | None = None
 
     @classmethod
     def load(cls, agent_dir: Path) -> "AgentManifest":
@@ -37,6 +40,7 @@ class AgentManifest:
 
         agent = data.get("agent", {})
         name = agent.get("name") or agent_dir.name
+        sandbox = SandboxConfig.parse(agent.get("sandbox"))
 
         functions: dict[str, FunctionDef] = {}
         for entry in data.get("function", []):
@@ -60,4 +64,5 @@ class AgentManifest:
             folder=agent_dir,
             description=agent.get("description", ""),
             functions=functions,
+            sandbox=sandbox,
         )

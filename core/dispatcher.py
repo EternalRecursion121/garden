@@ -120,7 +120,14 @@ class Dispatcher:
         if cache_key in self._impl_cache:
             return self._impl_cache[cache_key]
 
-        if fn.command:
+        if manifest.sandbox and manifest.sandbox.enabled:
+            from .sandbox import make_sandboxed_python_impl, make_sandboxed_command_impl
+            garden_root = manifest.folder.resolve().parent.parent
+            if fn.command:
+                impl = make_sandboxed_command_impl(garden_root, manifest, fn, manifest.sandbox)
+            else:
+                impl = make_sandboxed_python_impl(garden_root, manifest, fn, manifest.sandbox)
+        elif fn.command:
             impl = self._make_command_impl(manifest, fn)
         else:
             impl = self._load_python_impl(manifest, fn)
