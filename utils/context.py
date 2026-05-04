@@ -27,6 +27,19 @@ class Context:
     depth: int = 0
     _dispatch: Callable[..., Any] = None  # (qualified, params, parent_ctx, scope) -> Any
     _services: dict[str, Any] = field(default_factory=dict)
+    _list_functions: Callable[[Optional[str]], list[dict]] = None
+
+    def list_functions(self, agent: str | None = None) -> list[dict]:
+        """Discover what other functions exist in the garden.
+
+        Returns one dict per registered function with keys:
+        `qualified`, `agent`, `function`, `description`, `params`, `schedule`.
+        Pass `agent` to filter to a single namespace. Descriptions and param
+        types are free-form prose from each agent's manifest, not a schema.
+        """
+        if self._list_functions is None:
+            return []
+        return self._list_functions(agent)
 
     def service(self, name: str) -> Any | None:
         """Return a registered runtime service or None if not running.

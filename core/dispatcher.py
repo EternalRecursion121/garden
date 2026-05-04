@@ -73,6 +73,7 @@ class Dispatcher:
             depth=depth,
             _dispatch=self._dispatch_from_ctx,
             _services=self.services,
+            _list_functions=self._list_functions_from_ctx,
         )
 
         try:
@@ -107,6 +108,26 @@ class Dispatcher:
         scope: Optional[str],
     ) -> Any:
         return self.call(qualified, params, parent_ctx=parent_ctx, scope=scope)
+
+    def _list_functions_from_ctx(self, agent: Optional[str]) -> list[dict]:
+        out: list[dict] = []
+        if agent is None:
+            items = sorted(self.registry.agents.items())
+        elif agent in self.registry.agents:
+            items = [(agent, self.registry.agents[agent])]
+        else:
+            return []
+        for agent_name, manifest in items:
+            for fn in manifest.functions.values():
+                out.append({
+                    "qualified": f"{agent_name}.{fn.name}",
+                    "agent": agent_name,
+                    "function": fn.name,
+                    "description": fn.description,
+                    "params": dict(fn.params),
+                    "schedule": fn.schedule,
+                })
+        return out
 
     @staticmethod
     def _validate_params(qualified: str, fn: FunctionDef, params: dict) -> None:
