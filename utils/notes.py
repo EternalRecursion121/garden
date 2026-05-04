@@ -10,11 +10,17 @@ Two domains, two scopes, one substrate:
     fields: from, to ("<agent>" or "broadcast"), subject, body, in-reply-to,
             delivered (set true once the recipient processes it), created-at
 
-Why carry instead of files / Discord:
-  * CRDT-merge-safe — concurrent writes from sandboxed agents Just Work.
-  * Auditable — every cross-agent exchange is queryable.
-  * Asynchronous by default — Kira can answer Iris hours later without
-    losing thread, since `in-reply-to` chains the conversation.
+Identity comes from `ctx.agent` — set by the dispatcher when it calls into
+your function. You don't pass `agent=` / `reader=` / `sender=` / `recipient=`
+yourself: the helpers read it off ctx so you can't accidentally (or
+maliciously) write notes claiming to be another agent or read another
+agent's "personal" notes through these helpers.
+
+Caveat: the carry CLI itself is not ACL'd. An agent that bypasses these
+helpers and shells out to `carry assert garden.note agent=other-agent ...`
+can still forge claims. Treat per-agent scoping in carry as a discipline,
+not a security boundary; agents you don't trust shouldn't share a carry
+repo.
 
 Wikilinks
 ---------
@@ -22,10 +28,6 @@ A note can include `[[Title]]` references to other notes. Use `follow_link`
 to fetch a single linked note, or `expand_links` to substitute every
 wikilink in a body with the linked note's content (one level deep — does
 not recurse, to keep token budgets bounded).
-
-Both agents (and any future agent) can call these helpers because the carry
-binary lives in /usr/local/bin (mounted read-only by every sandbox) and the
-repo at <garden_root>/data/.carry/ is bound writable.
 """
 
 from __future__ import annotations
@@ -33,7 +35,6 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 from .carry import Carry
@@ -42,22 +43,33 @@ from .carry import Carry
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]\n]+?)\]\]")
 
 
+def _agent_of(ctx) -> str:
+    """Extract the running agent's name from ctx, refuse if missing."""
+    name = getattr(ctx, "agent", "") or ""
+    if not name:
+        raise RuntimeError(
+            "ctx.agent is empty; notes/messages helpers need a dispatcher-set "
+            "agent identity. Did you instantiate Context manually?"
+        )
+    return name
+
+
 # --- Notes (durable knowledge) ------------------------------------------
 
 
 def write_note(
     carry: Carry,
+    ctx,
     *,
-    agent: str,
     body: str,
     scope: str = "personal",
     tags: list[str] | None = None,
     source: str | None = None,
     title: str | None = None,
 ) -> str:
-    """Add a note. Returns the new claim's entity DID.
+    """Add a note attributed to the running agent (`ctx.agent`).
 
-    `scope`: "personal" (only this agent reads) or "shared" (any agent).
+    `scope`: "personal" (only this agent reads via these helpers) or "shared".
     `tags`: optional list of strings for categorisation.
     `source`: where this note came from (vault filename, dream id, …).
     `title`: optional human-readable title; required for wikilink targets.
@@ -67,7 +79,7 @@ def write_note(
     return carry.assert_(
         "garden.note",
         scope=scope,
-        agent=agent,
+        agent=_agent_of(ctx),
         title=title or "",
         body=body,
         tags=tags or [],
@@ -78,27 +90,27 @@ def write_note(
 
 def list_notes(
     carry: Carry,
+    ctx,
     *,
-    reader: str,
     tag: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return notes the `reader` agent can see: their own personal notes
-    plus all shared notes. Optionally filtered by tag."""
+    """Return notes the running agent can see: their own personal notes plus
+    all shared notes. Optionally filtered by tag."""
     rows = carry.query(
         "garden.note", "scope", "agent", "title", "body", "tags", "source", "created-at"
     )
-    return _filter_notes(rows or {}, reader=reader, tag=tag)
+    return _filter_notes(rows or {}, reader=_agent_of(ctx), tag=tag)
 
 
 # --- Wikilink navigation ------------------------------------------------
 
 
-def follow_link(carry: Carry, *, reader: str, title: str) -> dict[str, Any] | None:
-    """Resolve a `[[Title]]` reference. Returns the matching note (newest
-    if multiple share a title), respecting the reader's scope. None if no
-    match is visible to this reader."""
+def follow_link(carry: Carry, ctx, *, title: str) -> dict[str, Any] | None:
+    """Resolve a `[[Title]]` reference. Returns the matching note (newest if
+    multiple share a title), respecting the running agent's scope. None if
+    no match is visible."""
     matches = [
-        n for n in list_notes(carry, reader=reader)
+        n for n in list_notes(carry, ctx)
         if (n.get("title") or "").strip().lower() == title.strip().lower()
     ]
     if not matches:
@@ -112,7 +124,7 @@ def extract_links(body: str) -> list[str]:
     return [m.strip() for m in _WIKILINK_RE.findall(body)]
 
 
-def expand_links(carry: Carry, *, reader: str, body: str) -> str:
+def expand_links(carry: Carry, ctx, *, body: str) -> str:
     """One-level wikilink expansion: replace `[[Title]]` with the linked
     note's body, fenced by markers so the reader can see what was inlined.
     Unresolvable links stay as `[[Title]]` (nothing inserted).
@@ -126,7 +138,7 @@ def expand_links(carry: Carry, *, reader: str, body: str) -> str:
         title = match.group(1).strip()
         if title in seen:
             return seen[title]
-        target = follow_link(carry, reader=reader, title=title)
+        target = follow_link(carry, ctx, title=title)
         if target is None:
             seen[title] = match.group(0)
             return seen[title]
@@ -144,14 +156,15 @@ def expand_links(carry: Carry, *, reader: str, body: str) -> str:
 
 def send_message(
     carry: Carry,
+    ctx,
     *,
-    sender: str,
     recipient: str,
     subject: str,
     body: str,
     in_reply_to: str | None = None,
 ) -> str:
-    """Drop a message into another agent's inbox (or broadcast).
+    """Drop a message into another agent's inbox (or broadcast). Sender is
+    always the running agent (`ctx.agent`); the helper won't let you spoof.
 
     `recipient` may be `"broadcast"` to leave a message any agent can pick up.
     """
@@ -160,7 +173,7 @@ def send_message(
     # kebab-case because carry's attribute namespace forbids underscores.
     carry.assert_("garden.message", **{
         "id": msg_id,
-        "from": sender,
+        "from": _agent_of(ctx),
         "to": recipient,
         "subject": subject,
         "body": body,
@@ -173,16 +186,18 @@ def send_message(
 
 def fetch_inbox(
     carry: Carry,
+    ctx,
     *,
-    recipient: str,
     include_broadcast: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return undelivered messages addressed to this agent (and optionally
-    broadcasts). Caller is responsible for marking them delivered."""
+    """Return undelivered messages addressed to the running agent (and
+    optionally broadcasts). Caller is responsible for marking them
+    delivered."""
     rows = carry.query(
         "garden.message", "id", "from", "to", "subject", "body",
         "in-reply-to", "delivered", "created-at",
     )
+    recipient = _agent_of(ctx)
     out: list[dict[str, Any]] = []
     for did, fields in (rows or {}).items():
         m = fields.get("garden.message", {})
@@ -195,7 +210,21 @@ def fetch_inbox(
     return out
 
 
-def mark_delivered(carry: Carry, message_did: str) -> None:
+def mark_delivered(carry: Carry, ctx, message_did: str) -> None:
+    """Flip the `delivered` flag. Refuses if the message isn't addressed to
+    the running agent (or to broadcast)."""
+    rows = carry.query(
+        "garden.message", "to",
+    )
+    fields = (rows or {}).get(message_did, {}).get("garden.message", {})
+    if not fields:
+        raise ValueError(f"unknown message: {message_did}")
+    to = fields.get("to", "")
+    me = _agent_of(ctx)
+    if to != me and to != "broadcast":
+        raise PermissionError(
+            f"message {message_did} is addressed to {to!r}, not {me!r}; refusing to mark delivered"
+        )
     carry.assert_("garden.message", **{"this": message_did, "delivered": True})
 
 

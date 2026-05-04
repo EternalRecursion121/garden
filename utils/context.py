@@ -24,6 +24,7 @@ class Context:
     run_id: str
     parent_run_id: Optional[str]
     scope: Optional[str]
+    agent: str = ""                       # name of the agent currently running
     depth: int = 0
     _dispatch: Callable[..., Any] = None  # (qualified, params, parent_ctx, scope) -> Any
     _services: dict[str, Any] = field(default_factory=dict)

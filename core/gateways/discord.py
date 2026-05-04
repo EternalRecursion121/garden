@@ -111,9 +111,19 @@ class DiscordService:
     an asyncio loop. We bridge with `run_coroutine_threadsafe`.
     """
 
-    def __init__(self, client, loop: asyncio.AbstractEventLoop):
+    def __init__(self, client, loop: asyncio.AbstractEventLoop, log=None):
         self._client = client
         self._loop = loop
+        self._log = log or (lambda _msg: None)
+
+    def _attach_logger(self, fut, label: str) -> None:
+        """Log exceptions on fire-and-forget futures so silent failures don't
+        vanish into the void."""
+        def _on_done(f):
+            exc = f.exception()
+            if exc is not None:
+                self._log(f"{label} failed: {exc!r}")
+        fut.add_done_callback(_on_done)
 
     def send(self, *, channel_id: str | int, text: str, wait: bool = False) -> None:
         """Post `text` to a Discord channel (guild channel or DM channel).
@@ -124,6 +134,8 @@ class DiscordService:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         if wait:
             fut.result(timeout=30)
+        else:
+            self._attach_logger(fut, f"send to {channel_id}")
 
     def dm(self, *, user_id: str | int, text: str, wait: bool = False) -> None:
         """Send a DM to a user, opening the DM channel if needed."""
@@ -131,6 +143,8 @@ class DiscordService:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         if wait:
             fut.result(timeout=30)
+        else:
+            self._attach_logger(fut, f"dm to {user_id}")
 
     async def _send(self, channel_id: int, text: str) -> None:
         channel = self._client.get_channel(channel_id)
@@ -153,9 +167,11 @@ class DiscordGateway:
         *,
         token: str,
         allowed_guilds: Optional[set[int]] = None,
+        allowed_dm_users: Optional[set[int]] = None,
         ignore_bots: bool = True,
         max_parallel: int = 8,
         dedup_ttl: float = 300.0,
+        refresh_interval: float = 5.0,
         log: bool = True,
     ):
         if discord is None:
@@ -168,10 +184,27 @@ class DiscordGateway:
         self.dispatcher = dispatcher
         self.token = token
         self.allowed_guilds = allowed_guilds
+        # If set, only DMs from these user IDs are dispatched. DMs from anyone
+        # else are dropped silently — keeps random users from triggering
+        # paid LLM calls just by DMing the bot. None = allow no DMs at all
+        # (safer default than "anyone can DM"). Pass an empty set explicitly
+        # to mean "block all DMs"; pass None to mean the same.
+        self.allowed_dm_users = allowed_dm_users
         self.ignore_bots = ignore_bots
         self.max_parallel = max_parallel
         self.log = log
         self._dedup = MessageDeduplicator(ttl_seconds=dedup_ttl)
+        # Shared across all messages so we don't pay thread-pool startup per
+        # event and so `max_parallel` is a gateway-wide cap rather than a
+        # per-message cap. Sized for fan-out across concurrent inbound events.
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_parallel, thread_name_prefix="garden-gw-discord"
+        )
+        # Debounce registry refresh: file-system scan on every Discord message
+        # blocks the event loop and wastes work. `refresh_interval` is the
+        # minimum gap between scans.
+        self._refresh_interval = refresh_interval
+        self._last_refresh = 0.0
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -200,6 +233,17 @@ class DiscordGateway:
                 and message.guild.id not in self.allowed_guilds
             ):
                 return
+            # DM allow-list: drop DMs from anyone not on the list. With no
+            # list configured, all DMs are dropped (no "anyone with the bot's
+            # name can spam it" default).
+            if message.guild is None:
+                allowed = self.allowed_dm_users or set()
+                if message.author.id not in allowed:
+                    self._log(
+                        f"dropping DM from {message.author.id} ({message.author.display_name!r}) "
+                        f"— not in allowed_dm_users"
+                    )
+                    return
             if self._dedup.seen(str(message.id)):
                 self._log(f"dedup: dropping replay of {message.id}")
                 return
@@ -207,14 +251,24 @@ class DiscordGateway:
 
     def _register_service(self) -> None:
         self.dispatcher.services["discord"] = DiscordService(
-            self.client, self.client.loop
+            self.client, self.client.loop, log=self._log
         )
+
+    async def _maybe_refresh_registry(self) -> None:
+        """Refresh the registry at most once per `_refresh_interval`. The scan
+        walks the agents directory, so we don't want to do it on the asyncio
+        loop for every inbound message."""
+        if time.time() - self._last_refresh < self._refresh_interval:
+            return
+        self._last_refresh = time.time()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self.dispatcher.registry.refresh)
 
     # dispatch -----------------------------------------------------------
 
     async def _handle(self, message) -> None:
         channel_id = str(message.channel.id)
-        self.dispatcher.registry.refresh()
+        await self._maybe_refresh_registry()
         subs = self.dispatcher.registry.subscribers_for(channel_id)
         if not subs:
             return
@@ -246,7 +300,11 @@ class DiscordGateway:
         it has a `reply` field, post it to the channel prefixed with the
         agent's name. Sandboxed functions can't reach `ctx.service('discord')`
         from another process, so this return-protocol is the only outbound
-        path available to them. Unsandboxed functions can use either."""
+        path available to them. Unsandboxed functions can use either.
+
+        Uses the gateway-wide executor — concurrent messages compete for the
+        same `max_parallel` worker budget rather than each spawning their own
+        pool."""
         loop = asyncio.get_running_loop()
 
         def call_one(qualified: str):
@@ -256,10 +314,9 @@ class DiscordGateway:
                 self._log(f"{qualified} raised: {e}")
                 return qualified, None
 
-        with ThreadPoolExecutor(max_workers=min(self.max_parallel, len(subs))) as ex:
-            results = await asyncio.gather(
-                *(loop.run_in_executor(ex, call_one, qualified) for qualified, _ in subs)
-            )
+        results = await asyncio.gather(
+            *(loop.run_in_executor(self._executor, call_one, qualified) for qualified, _ in subs)
+        )
 
         for qualified, result in results:
             if not isinstance(result, dict) or result.get("silent"):
@@ -283,7 +340,10 @@ class DiscordGateway:
 
     def run(self) -> None:
         self._log("starting; channel-subscription routing, output via ctx.service('discord')")
-        self.client.run(self.token)
+        try:
+            self.client.run(self.token)
+        finally:
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
     # logging ------------------------------------------------------------
 
@@ -310,9 +370,11 @@ def from_config(dispatcher: Dispatcher, cfg: dict) -> DiscordGateway:
     """Build a gateway from a `[gateway.discord]` table in garden.toml.
 
     Recognized keys:
-      allowed_guilds   list[int] — restrict to specific guilds (optional)
-      token_env        env var holding the bot token (default DISCORD_TOKEN)
-      dedup_ttl        seconds to remember message ids (default 300)
+      allowed_guilds    list[int] — restrict to specific guilds (optional)
+      allowed_dm_users  list[int] — user IDs allowed to DM the bot. Omit/empty
+                        ⇒ all DMs dropped (default; safer than "anyone").
+      token_env         env var holding the bot token (default DISCORD_TOKEN)
+      dedup_ttl         seconds to remember message ids (default 300)
     """
     token_env = cfg.get("token_env", "DISCORD_TOKEN")
     token = os.environ.get(token_env, "")
@@ -324,5 +386,9 @@ def from_config(dispatcher: Dispatcher, cfg: dict) -> DiscordGateway:
         dispatcher,
         token=token,
         allowed_guilds=set(cfg["allowed_guilds"]) if cfg.get("allowed_guilds") else None,
+        allowed_dm_users=(
+            set(int(u) for u in cfg["allowed_dm_users"])
+            if cfg.get("allowed_dm_users") else None
+        ),
         dedup_ttl=float(cfg.get("dedup_ttl", 300)),
     )

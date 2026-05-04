@@ -17,6 +17,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -36,6 +37,7 @@ class Dispatcher:
         self.carry = carry
         self.log = log
         self._impl_cache: dict[str, Callable[..., Any]] = {}
+        self._impl_cache_lock = threading.Lock()
         # Outbound services attached by long-running processes (gateways).
         # Functions reach them via ctx.service(name); inbound and outbound
         # are independent — a function subscribed to a Discord channel does
@@ -70,6 +72,7 @@ class Dispatcher:
             run_id=run_id,
             parent_run_id=parent_run_id,
             scope=scope,
+            agent=manifest.name,
             depth=depth,
             _dispatch=self._dispatch_from_ctx,
             _services=self.services,
@@ -138,36 +141,47 @@ class Dispatcher:
 
     def _load_impl(self, manifest: AgentManifest, fn: FunctionDef) -> Callable[..., Any]:
         cache_key = f"{manifest.name}.{fn.name}"
-        if cache_key in self._impl_cache:
-            return self._impl_cache[cache_key]
+        # Lock so two threads loading the same impl for the first time don't
+        # both exec_module and double-fire side effects.
+        with self._impl_cache_lock:
+            if cache_key in self._impl_cache:
+                return self._impl_cache[cache_key]
 
-        # Per-function override wins; otherwise fall back to agent-level setting.
-        agent_sandboxed = bool(manifest.sandbox and manifest.sandbox.enabled)
-        sandboxed = (
-            fn.sandbox_override if fn.sandbox_override is not None else agent_sandboxed
-        )
-        if sandboxed:
-            from .sandbox import make_sandboxed_python_impl, make_sandboxed_command_impl
-            cfg = manifest.sandbox or __import__("core.sandbox", fromlist=["SandboxConfig"]).SandboxConfig(enabled=True)
-            garden_root = manifest.folder.resolve().parent.parent
-            if fn.command:
-                impl = make_sandboxed_command_impl(garden_root, manifest, fn, cfg)
+            # Per-function override wins; otherwise fall back to agent-level setting.
+            agent_sandboxed = bool(manifest.sandbox.enabled)
+            sandboxed = (
+                fn.sandbox_override if fn.sandbox_override is not None else agent_sandboxed
+            )
+            if sandboxed:
+                from .sandbox import make_sandboxed_python_impl, make_sandboxed_command_impl
+                cfg = manifest.sandbox
+                garden_root = manifest.folder.resolve().parent.parent
+                if fn.command:
+                    impl = make_sandboxed_command_impl(garden_root, manifest, fn, cfg)
+                else:
+                    impl = make_sandboxed_python_impl(garden_root, manifest, fn, cfg)
+            elif fn.command:
+                impl = self._make_command_impl(manifest, fn)
             else:
-                impl = make_sandboxed_python_impl(garden_root, manifest, fn, cfg)
-        elif fn.command:
-            impl = self._make_command_impl(manifest, fn)
-        else:
-            impl = self._load_python_impl(manifest, fn)
+                impl = self._load_python_impl(manifest, fn)
 
-        self._impl_cache[cache_key] = impl
-        return impl
+            self._impl_cache[cache_key] = impl
+            return impl
 
     @staticmethod
     def _load_python_impl(manifest: AgentManifest, fn: FunctionDef) -> Callable[..., Any]:
         assert fn.impl is not None
         path_part, _, func_name = fn.impl.partition(":")
         func_name = func_name or "run"
-        impl_path = (manifest.folder / path_part).resolve()
+        agent_root = manifest.folder.resolve()
+        impl_path = (agent_root / path_part).resolve()
+        # Refuse path-traversal: the impl must live inside the agent's folder.
+        try:
+            impl_path.relative_to(agent_root)
+        except ValueError:
+            raise ValueError(
+                f"impl {fn.impl!r} resolves to {impl_path}, outside agent folder {agent_root}"
+            ) from None
         if not impl_path.exists():
             raise FileNotFoundError(f"impl not found: {impl_path}")
 
@@ -192,6 +206,7 @@ class Dispatcher:
     def _make_command_impl(manifest: AgentManifest, fn: FunctionDef) -> Callable[..., Any]:
         cmd = fn.command
         cwd = str(manifest.folder)
+        timeout = fn.timeout
 
         def impl(params: dict, ctx: Context) -> Any:
             payload = json.dumps({
@@ -202,9 +217,13 @@ class Dispatcher:
                     "scope": ctx.scope,
                 },
             })
-            proc = subprocess.run(
-                cmd, input=payload, capture_output=True, text=True, cwd=cwd, check=False
-            )
+            try:
+                proc = subprocess.run(
+                    cmd, input=payload, capture_output=True, text=True, cwd=cwd,
+                    check=False, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(f"command timed out after {timeout}s") from e
             if proc.returncode != 0:
                 raise RuntimeError(f"command exited {proc.returncode}: {proc.stderr}")
             stdout = proc.stdout.strip()

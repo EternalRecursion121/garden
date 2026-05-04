@@ -96,6 +96,29 @@ def cmd_schedule(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Programmatic Q&A with an agent — routes to <agent>.consult.
+
+    Use this when you (the operator) need an agent's input on a decision
+    rather than asking a human. The agent's consult function is invoked
+    with the question (and optional context), the answer is printed.
+    """
+    dispatcher = _make_dispatcher()
+    qualified = f"{args.agent}.consult"
+    params = {"question": args.question}
+    if args.context:
+        params["context"] = args.context
+    if args.file:
+        body = Path(args.file).read_text()
+        params["context"] = (params.get("context", "") + "\n\n" + body).strip()
+    result = dispatcher.call(qualified, params=params)
+    if isinstance(result, dict) and "answer" in result:
+        print(result["answer"])
+    else:
+        print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
 def cmd_gateway(args: argparse.Namespace) -> int:
     cfg = _load_config().get("gateway", {}).get(args.kind, {})
     dispatcher = _make_dispatcher()
@@ -130,6 +153,13 @@ def main() -> None:
     s = sub.add_parser("gateway", help="run an event gateway: <kind>")
     s.add_argument("kind", choices=["discord"])
     s.set_defaults(func=cmd_gateway)
+
+    s = sub.add_parser("ask", help="ask an agent a question (routes to <agent>.consult)")
+    s.add_argument("agent", help="agent name, e.g. iris or kira")
+    s.add_argument("question", help="the question")
+    s.add_argument("--context", "-c", default="", help="additional context string")
+    s.add_argument("--file", "-f", default=None, help="path to a file to attach as context")
+    s.set_defaults(func=cmd_ask)
 
     args = p.parse_args()
     sys.exit(args.func(args) or 0)

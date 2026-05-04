@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,17 @@ class CarryError(RuntimeError):
 
 
 class Carry:
-    def __init__(self, repo_path: Path | str):
+    # Hard cap on a single carry CLI invocation. A wedged carry shouldn't
+    # block the gateway/scheduler indefinitely.
+    _DEFAULT_TIMEOUT: float = 60.0
+
+    def __init__(self, repo_path: Path | str, *, timeout: float | None = None):
         self.repo_path = Path(repo_path)
+        self.timeout = self._DEFAULT_TIMEOUT if timeout is None else timeout
+        # Carry's on-disk store isn't safe under concurrent CLI invocations
+        # against the same .carry/ dir. Now that scheduler + gateway dispatch
+        # in parallel, serialize CLI calls on this Carry instance.
+        self._cli_lock = threading.Lock()
 
     def available(self) -> bool:
         return shutil.which("carry") is not None
@@ -44,18 +54,38 @@ class Carry:
             args.append(f"{k}={self._serialize(v)}")
         return self._run(args).strip()
 
-    def query(self, domain: str, *fields: str, **filters: Any) -> Any:
+    def query(self, domain: str, *fields: str, **filters: Any) -> dict[str, dict[str, Any]]:
+        """Query a domain. Returns `{did: {domain: {field: value}}}`.
+
+        Uses `--format json` to avoid YAML parsing landmines when bodies
+        contain markdown / JSON / quotes. List-valued fields stored via
+        `_serialize` come back as JSON strings — best-effort decoded here.
+        """
         args = ["carry", "query", domain]
         for k, v in filters.items():
             args.append(f"{k}={self._serialize(v)}")
         for f in fields:
             args.append(f)
+        args += ["--format", "json"]
         out = self._run(args)
         try:
-            import yaml
-            return yaml.safe_load(out)
-        except Exception:
-            return out
+            rows = json.loads(out) if out.strip() else []
+        except json.JSONDecodeError:
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            did = row.pop("id", None) or row.pop("entity", None)
+            if did is None:
+                continue
+            # Best-effort decode of fields that look like JSON containers.
+            for k, v in list(row.items()):
+                if isinstance(v, str) and v and v[0] in "[{":
+                    try:
+                        row[k] = json.loads(v)
+                    except json.JSONDecodeError:
+                        pass
+            result[did] = {domain: row}
+        return result
 
     def retract(self, domain: str, did: str, *fields: str) -> None:
         args = ["carry", "retract", domain, f"this={did}", *fields]
@@ -67,9 +97,16 @@ class Carry:
                 "`carry` CLI not found in PATH. Install from "
                 "https://github.com/tonk-labs/carry"
             )
-        result = subprocess.run(
-            args, cwd=self.repo_path, capture_output=True, text=True
-        )
+        with self._cli_lock:
+            try:
+                result = subprocess.run(
+                    args, cwd=self.repo_path, capture_output=True, text=True,
+                    timeout=self.timeout if self.timeout > 0 else None,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise CarryError(
+                    f"carry {' '.join(args[1:])} timed out after {self.timeout}s"
+                ) from e
         if result.returncode != 0:
             raise CarryError(
                 f"carry {' '.join(args[1:])} failed: {result.stderr.strip()}"

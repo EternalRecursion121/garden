@@ -84,6 +84,35 @@ class ClaudeCode:
         if shutil.which(self.bin) is None:
             raise RuntimeError(f"`{self.bin}` CLI not found in PATH")
 
+    def _build_argv(
+        self,
+        *,
+        prompt: str,
+        system: str | None,
+        session_id: str | None,
+        resume: bool,
+    ) -> list[str]:
+        """Build claude argv with the prompt last, after a `--` separator.
+
+        Putting the prompt last and behind `--` keeps a prompt that happens
+        to start with `--` from being parsed as a flag (defense in depth —
+        a prompt-injection that controls user input shouldn't be able to
+        smuggle in `--mcp-config` etc.).
+        """
+        argv: list[str] = [self.bin, "-p"]
+        if session_id:
+            argv += ["--resume" if resume else "--session-id", session_id]
+        if self.exclude_dynamic_sections:
+            argv += ["--exclude-dynamic-system-prompt-sections"]
+        if system:
+            argv += ["--append-system-prompt", system]
+        if self.model:
+            argv += ["--model", self.model]
+        if self.allowed_tools:
+            argv += ["--allowedTools", ",".join(self.allowed_tools)]
+        argv += ["--", prompt]
+        return argv
+
     def invoke(
         self,
         *,
@@ -93,21 +122,12 @@ class ClaudeCode:
         fork_on_overflow: bool = True,
         **kwargs: Any,
     ) -> Result:
-        cmd = [self.bin, "-p", prompt]
-        if self.session_id:
-            # First call → create with this UUID; subsequent calls → resume.
-            if _session_exists(self.session_id, self.cwd):
-                cmd += ["--resume", self.session_id]
-            else:
-                cmd += ["--session-id", self.session_id]
-        if self.exclude_dynamic_sections:
-            cmd += ["--exclude-dynamic-system-prompt-sections"]
-        if system:
-            cmd += ["--append-system-prompt", system]
-        if self.model:
-            cmd += ["--model", self.model]
-        if self.allowed_tools:
-            cmd += ["--allowedTools", ",".join(self.allowed_tools)]
+        cmd = self._build_argv(
+            prompt=prompt,
+            system=system,
+            session_id=self.session_id,
+            resume=bool(self.session_id) and _session_exists(self.session_id, self.cwd),
+        )
 
         env = os.environ.copy()
         if self.autocompact_pct is not None:
@@ -134,13 +154,12 @@ class ClaudeCode:
                 forked = stable_session_id(
                     f"{self.session_id}/fork-{int(__import__('time').time())}"
                 )
-                fork_cmd = [self.bin, "-p", prompt, "--session-id", forked]
-                if self.exclude_dynamic_sections:
-                    fork_cmd += ["--exclude-dynamic-system-prompt-sections"]
-                if system:
-                    fork_cmd += ["--append-system-prompt", system]
-                if self.model:
-                    fork_cmd += ["--model", self.model]
+                fork_cmd = self._build_argv(
+                    prompt=prompt,
+                    system=system,
+                    session_id=forked,
+                    resume=False,  # new id, no on-disk session yet
+                )
                 proc = subprocess.run(
                     fork_cmd, capture_output=True, text=True,
                     cwd=self.cwd, check=False, timeout=timeout, env=env,
