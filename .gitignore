@@ -15,3 +15,5 @@ agents/*
 !agents/.gitkeep
 data/*
 !data/.gitkeep
+
+CLAUDE.md
