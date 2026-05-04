@@ -1,0 +1,6 @@
+# The curator ships with garden but its behaviour is intentionally undefined
+# here — see SPEC.md §6. Add functions as you decide what the curator should do.
+
+[agent]
+name = "curator"
+description = "Tends the shared knowledge store. Behaviour TBD."

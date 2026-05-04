@@ -1,0 +1,9 @@
+# Garden runtime config. Defaults are fine for local use.
+
+[carry]
+# Path (relative to garden root) where the shared carry repo lives.
+repo = "data"
+
+[scheduler]
+# Seconds between cron polls.
+poll_interval = 30

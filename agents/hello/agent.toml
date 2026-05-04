@@ -1,0 +1,15 @@
+[agent]
+name = "hello"
+description = "Example agent. Demonstrates calling a backend and fan-out via ctx.map."
+
+[[function]]
+name        = "greet"
+description = "Ask a model to greet someone."
+impl        = "functions/greet.py:run"
+params      = { name = "string", tier = "string?" }
+
+[[function]]
+name        = "greet_many"
+description = "Fan out greet() across many names in parallel."
+impl        = "functions/greet.py:greet_many"
+params      = { names = "list" }
