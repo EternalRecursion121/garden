@@ -18,16 +18,17 @@ garden/
 │   ├── registry.py         # discovers agents/ and loads their manifests
 │   ├── dispatcher.py       # invokes a function (params + context) → run handle
 │   ├── scheduler.py        # cron loop
+│   ├── gateways/           # one module per inbound source (discord, …)
 │   └── adapters/           # one module per backend (claude_code, hermes, codex, openrouter, …)
 ├── utils/                  # shared helpers (carry wrapper, context, IO, secrets)
-├── data/
-│   └── .carry/             # the single shared carry repository
-└── agents/
-    └── <agent-name>/       # one folder per agent — owned by the agent
+├── examples/               # reference agents — copy into agents/ to use
+├── data/                   # populated per-installation; the single shared carry repo lives here
+└── agents/                 # populated per-installation; one folder per agent
+    └── <agent-name>/       # owned by the agent
         └── agent.toml      # the only file garden requires
 ```
 
-`core/` and `utils/` belong to garden. `data/.carry/` is shared. Everything under `agents/<name>/` belongs to that agent — it can `git init`, install deps, restructure freely. Garden only requires `agent.toml` at the folder root.
+`core/` and `utils/` belong to garden. `data/.carry/` is shared. Everything under `agents/<name>/` belongs to that agent — it can `git init`, install deps, restructure freely. Garden only requires `agent.toml` at the folder root. `agents/` and `data/` ship empty — drop in your own, or copy from `examples/`.
 
 ---
 

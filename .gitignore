@@ -4,8 +4,14 @@ __pycache__/
 .venv/
 venv/
 .env
-data/.carry/
-data/runs/
 *.egg-info/
 dist/
 build/
+
+# Agents and data are populated per-installation. Garden ships an empty
+# `agents/` and `data/` so anyone can drop in their own. See `examples/`
+# for reference agents.
+agents/*
+!agents/.gitkeep
+data/*
+!data/.gitkeep

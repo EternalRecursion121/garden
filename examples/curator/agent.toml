@@ -1,0 +1,6 @@
+# Minimal manifest. Defines an agent with no functions — copy into
+# `agents/curator/` and add functions to give it behaviour.
+
+[agent]
+name = "curator"
+description = "Tends the shared knowledge store. Behaviour TBD."
