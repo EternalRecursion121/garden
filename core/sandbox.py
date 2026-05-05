@@ -298,6 +298,7 @@ def make_sandboxed_python_impl(
             sys.executable,
             "-m", "core.sandbox",
             "--impl", f"{impl_path}:{func_name}",
+            "--agent-root", str(agent_root),
         ]
         payload = json.dumps({
             "params": params,
@@ -452,6 +453,7 @@ def _runner_main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--impl", required=True, help="absolute/path.py:function")
+    parser.add_argument("--agent-root", default="", help="absolute agent folder")
     args = parser.parse_args()
 
     raw = sys.stdin.read()
@@ -479,16 +481,19 @@ def _runner_main() -> int:
         emit_error("FileNotFoundError", f"impl not found: {impl_path}", "")
         return 2
 
+    if args.agent_root:
+        sys.path.insert(0, args.agent_root)
     sys.path.insert(0, str(impl_path.parent))
 
     spec_name = f"_garden_sandbox_{impl_path.stem}"
     spec = importlib.util.spec_from_file_location(spec_name, impl_path)
-    if spec is None or spec.loader is None:
+    if spec is None:
         emit_error("ImportError", f"cannot load {impl_path}", "")
         return 2
     mod = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(mod)
+        source = impl_path.read_text(encoding="utf-8")
+        exec(compile(source, str(impl_path), "exec"), mod.__dict__)
     except Exception as e:
         emit_error(type(e).__name__, str(e), traceback.format_exc())
         return 1

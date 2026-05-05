@@ -23,6 +23,11 @@ class Registry:
             if not (entry / "agent.toml").exists():
                 continue
             manifest = AgentManifest.load(entry)
+            if manifest.name in self.agents:
+                prev = self.agents[manifest.name].folder
+                raise ValueError(
+                    f"duplicate agent name {manifest.name!r}: {prev} and {entry}"
+                )
             self.agents[manifest.name] = manifest
 
     def lookup(self, qualified: str) -> tuple[AgentManifest, FunctionDef]:
@@ -57,5 +62,21 @@ class Registry:
             m = self.agents[agent_name]
             for fn in m.functions.values():
                 if channel_id in fn.channels:
+                    out.append((f"{agent_name}.{fn.name}", fn))
+        return out
+
+    def command_subscribers_for(self, token: str) -> list[tuple[str, FunctionDef]]:
+        """Functions that registered a slash-command token via `commands = [...]`.
+
+        Tokens are matched verbatim (case-sensitive) against the first word of
+        a Discord message. A command is global — it fires regardless of which
+        channel the message came from, on top of the gateway's existing
+        guild/DM allow-listing.
+        """
+        out: list[tuple[str, FunctionDef]] = []
+        for agent_name in sorted(self.agents):
+            m = self.agents[agent_name]
+            for fn in m.functions.values():
+                if token in fn.commands:
                     out.append((f"{agent_name}.{fn.name}", fn))
         return out

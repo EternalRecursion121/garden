@@ -61,7 +61,9 @@ Inbound params
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -70,8 +72,10 @@ from ..dispatcher import Dispatcher
 
 try:
     import discord  # type: ignore
+    from discord import app_commands  # type: ignore
 except ImportError:
     discord = None  # soft-fail; raised in __init__
+    app_commands = None  # type: ignore
 
 
 # --- dedup ---------------------------------------------------------------
@@ -157,6 +161,123 @@ class DiscordService:
         await user.send(text)
 
 
+# --- audit batching ------------------------------------------------------
+
+
+def _fmt_preview(value, limit: int = 120) -> str:
+    try:
+        s = value if isinstance(value, str) else json.dumps(value, default=str)
+    except Exception:
+        s = str(value)
+    s = s.replace("\n", " ").replace("\r", " ")
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def _format_audit_line(event: dict) -> str:
+    icon = "✓" if event.get("status") == "ok" else "✗"
+    qualified = event.get("qualified", "?")
+    run_id = (event.get("run_id") or "")[:8]
+    duration = event.get("duration", 0.0)
+    depth = int(event.get("depth", 0))
+    indent = "·" * depth
+    params = event.get("params") or {}
+    tail = (
+        f"err: {_fmt_preview(event.get('error'), 200)}"
+        if event.get("status") != "ok"
+        else _fmt_preview(event.get("result"))
+    )
+    params_preview = _fmt_preview(params, 80) if params else ""
+    line = (
+        f"`{icon} {indent}{qualified} [{run_id}] {duration:.2f}s`"
+        + (f"  in: {params_preview}" if params_preview else "")
+        + (f"  → {tail}" if tail else "")
+    )
+    if len(line) > 1900:
+        line = line[:1899] + "…"
+    return line
+
+
+class _AuditBuffer:
+    """Coalesces audit lines into batched Discord posts.
+
+    Discord caps text channels at ~5 messages/sec; per-call audit posts
+    blow that out under any fan-out (cron tick + user message + ctx.map).
+    We append lines from worker threads, then a single async loop flushes
+    every `interval` seconds, packing as many lines as fit in 1900 chars
+    per Discord message.
+    """
+
+    def __init__(self, channel_id: int, send_async, log, interval: float = 0.7):
+        self._channel_id = channel_id
+        self._send_async = send_async  # async (channel_id, text) -> None
+        self._log = log
+        self._interval = interval
+        self._lines: list[str] = []
+        self._lock = threading.Lock()
+
+    def append(self, line: str) -> None:
+        with self._lock:
+            self._lines.append(line)
+
+    async def run_forever(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval)
+            with self._lock:
+                if not self._lines:
+                    continue
+                pending = self._lines
+                self._lines = []
+            # Pack into chunks of ≤ 1900 chars (Discord limit is 2000).
+            chunks: list[str] = []
+            current: list[str] = []
+            current_len = 0
+            for line in pending:
+                add = len(line) + 1
+                if current and current_len + add > 1900:
+                    chunks.append("\n".join(current))
+                    current, current_len = [], 0
+                current.append(line)
+                current_len += add
+            if current:
+                chunks.append("\n".join(current))
+            for chunk in chunks:
+                try:
+                    await self._send_async(self._channel_id, chunk)
+                except Exception as e:
+                    self._log(f"audit flush failed: {e}")
+
+
+def _thread_name(content: str, fallback: str = "conversation") -> str:
+    """Build a Discord thread name from a message body.
+
+    Discord caps thread names at 100 chars and disallows newlines. We trim
+    to 80 to leave headroom and replace whitespace runs with single spaces.
+    """
+    s = (content or "").strip().replace("\n", " ").replace("\r", " ")
+    s = " ".join(s.split())
+    if not s:
+        s = fallback
+    return s[:80]
+
+
+def _reply_payloads(agent_name: str, replies: list[str], limit: int = 1990) -> list[str]:
+    """Build Discord-safe reply payloads with the agent prefix on each chunk."""
+    prefix = f"**[{agent_name}]** "
+    if len(prefix) >= limit:
+        prefix = prefix[: max(0, limit - 1)]
+    room = max(1, limit - len(prefix))
+    payloads: list[str] = []
+    for body in replies:
+        text = body.strip()
+        if not text:
+            continue
+        while text:
+            chunk = text[:room]
+            payloads.append(prefix + chunk)
+            text = text[room:]
+    return payloads
+
+
 # --- gateway -------------------------------------------------------------
 
 
@@ -212,6 +333,12 @@ class DiscordGateway:
         intents.message_content = True
         intents.dm_messages = True
         self.client = discord.Client(intents=intents)
+        # CommandTree owns Discord application (slash) commands. We register
+        # one app command per `commands = [...]` entry in the manifest and
+        # sync per-guild on connect for instant propagation. The legacy
+        # text-prefix path in `_handle` still works in parallel — slash UI
+        # fires `on_interaction`, not `on_message`, so they don't double-fire.
+        self.tree = app_commands.CommandTree(self.client)
         self._wire()
 
     # event wiring -------------------------------------------------------
@@ -221,6 +348,7 @@ class DiscordGateway:
         async def on_ready():
             self._register_service()
             self._log_subscribers()
+            await self._register_app_commands()
             self._log(f"connected as {self.client.user}")
 
         @self.client.event
@@ -259,54 +387,194 @@ class DiscordGateway:
         service = DiscordService(self.client, self.client.loop, log=self._log)
         self.dispatcher.services["discord"] = service
         if self.audit_channel_id is not None:
-            self.dispatcher.audit_hook = self._make_audit_hook(service)
+            self._audit_buffer = _AuditBuffer(
+                channel_id=self.audit_channel_id,
+                send_async=self._audit_send,
+                log=self._log,
+            )
+            self.dispatcher.audit_hook = self._make_audit_hook(self._audit_buffer)
+            asyncio.create_task(self._audit_buffer.run_forever())
             self._log(f"audit channel: {self.audit_channel_id}")
 
-    def _make_audit_hook(self, service: "DiscordService"):
-        """Build a fire-and-forget audit hook bound to the discord service.
+    # app commands ------------------------------------------------------
 
-        Hook is called from worker threads (the dispatcher runs impls under
-        the gateway's executor). DiscordService.send already bridges back
-        to the asyncio loop, so there's no extra threading work here. We
-        keep the formatting minimal — one line per call.
+    async def _register_app_commands(self) -> None:
+        """Walk the registry and register one Discord application command per
+        manifest `commands = [...]` entry, then sync.
+
+        Sync strategy: per-guild for any guild in `allowed_guilds` (instant
+        propagation), or global as a fallback (Discord caches up to 1h).
+        Re-running this clears prior registrations on the tree first so a
+        reconnect doesn't accumulate stale commands.
+
+        Each app command takes a single optional `text` parameter — that's
+        what gets passed to the function as `args`, matching the legacy
+        text-prefix path. Per-command rich parameter schemas would require
+        a manifest extension; out of scope for now.
         """
-        channel_id = self.audit_channel_id
+        # Make sure the registry is fresh — on_ready fires before any
+        # message would have triggered _maybe_refresh_registry.
+        self.dispatcher.registry.refresh()
 
-        def fmt_preview(value, limit: int = 120) -> str:
-            try:
-                s = value if isinstance(value, str) else __import__("json").dumps(value, default=str)
-            except Exception:
-                s = str(value)
-            s = s.replace("\n", " ").replace("\r", " ")
-            return s if len(s) <= limit else s[: limit - 1] + "…"
+        # Wipe any commands previously bound to this tree (in-memory).
+        self.tree.clear_commands(guild=None)
+        for gid in (self.allowed_guilds or []):
+            self.tree.clear_commands(guild=discord.Object(id=gid))
 
-        def hook(event: dict) -> None:
-            icon = "✓" if event.get("status") == "ok" else "✗"
-            qualified = event.get("qualified", "?")
-            run_id = (event.get("run_id") or "")[:8]
-            duration = event.get("duration", 0.0)
-            depth = int(event.get("depth", 0))
-            indent = "·" * depth
-            params = event.get("params") or {}
-            tail = (
-                f"err: {fmt_preview(event.get('error'), 200)}"
-                if event.get("status") != "ok"
-                else fmt_preview(event.get("result"))
+        seen: dict[str, str] = {}
+        for agent_name in sorted(self.dispatcher.registry.agents):
+            m = self.dispatcher.registry.agents[agent_name]
+            for fn in m.functions.values():
+                for token in fn.commands:
+                    name = token.lstrip("/").strip()
+                    if not name:
+                        continue
+                    if name in seen:
+                        self._log(
+                            f"app command /{name}: collision between "
+                            f"{seen[name]} and {agent_name}.{fn.name}; keeping first"
+                        )
+                        continue
+                    qualified = f"{agent_name}.{fn.name}"
+                    seen[name] = qualified
+                    description = (fn.description or qualified)[:100]
+                    self._add_app_command(name, description, qualified)
+
+        if not seen:
+            self._log("app commands: no /commands declared in manifests")
+            return
+
+        if self.allowed_guilds:
+            for gid in self.allowed_guilds:
+                guild = discord.Object(id=gid)
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                self._log(
+                    f"app commands: synced {len(synced)} to guild {gid} "
+                    f"({', '.join('/' + c.name for c in synced)})"
+                )
+        else:
+            synced = await self.tree.sync()
+            self._log(
+                f"app commands: synced {len(synced)} globally — propagation "
+                f"may take up to 1h ({', '.join('/' + c.name for c in synced)})"
             )
-            params_preview = fmt_preview(params, 80) if params else ""
-            line = (
-                f"`{icon} {indent}{qualified} [{run_id}] {duration:.2f}s`"
-                + (f"  in: {params_preview}" if params_preview else "")
-                + (f"  → {tail}" if tail else "")
+
+    def _add_app_command(self, name: str, description: str, qualified: str) -> None:
+        """Build and add one app command. Bound `qualified` via default-arg
+        capture so the closure doesn't drift across loop iterations."""
+        async def callback(
+            interaction: "discord.Interaction",
+            text: str = "",
+            _qualified: str = qualified,
+        ) -> None:
+            await self._handle_app_command(interaction, _qualified, text)
+
+        cmd = app_commands.Command(
+            name=name,
+            description=description,
+            callback=callback,
+        )
+        self.tree.add_command(cmd)
+
+    async def _handle_app_command(
+        self,
+        interaction: "discord.Interaction",
+        qualified: str,
+        text: str,
+    ) -> None:
+        """Dispatch an app command to a garden function and post the reply.
+
+        Mirrors `_dispatch_all`: defers the interaction so we have up to 15
+        minutes to reply, runs the impl on the gateway's executor (so app
+        commands compete for the same `max_parallel` budget as channel
+        messages), then posts the reply via followup.
+        """
+        # Same allow-listing as on_message — slash commands shouldn't bypass
+        # the guild/DM filters.
+        if interaction.guild is None:
+            allowed = self.allowed_dm_users or set()
+            if interaction.user.id not in allowed:
+                await interaction.response.send_message(
+                    "DMs aren't enabled for this user.", ephemeral=True
+                )
+                return
+        elif (
+            self.allowed_guilds is not None
+            and interaction.guild_id not in self.allowed_guilds
+        ):
+            await interaction.response.send_message(
+                "this guild isn't in the allow-list.", ephemeral=True
             )
-            # Discord hard-caps at 2000 chars; trim defensively.
-            if len(line) > 1900:
-                line = line[:1899] + "…"
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        params = {
+            "message": text,
+            "user_id": str(interaction.user.id),
+            "user_name": interaction.user.display_name,
+            "channel_id": str(interaction.channel_id) if interaction.channel_id else "",
+            "guild_id": str(interaction.guild_id) if interaction.guild_id else "",
+            "is_dm": interaction.guild is None,
+            "message_id": "",
+            "reply_to": None,
+            "command": "/" + (interaction.command.name if interaction.command else ""),
+            "args": text,
+        }
+
+        loop = asyncio.get_running_loop()
+
+        def call_one() -> Optional[dict]:
             try:
-                service.send(channel_id=channel_id, text=line)
+                return self.dispatcher.call(qualified, params=params)
             except Exception as e:
-                self._log(f"audit send failed: {e}")
+                self._log(f"{qualified} raised: {e}")
+                return {"reply": f"✗ {qualified} raised: {e}"}
 
+        result = await loop.run_in_executor(self._executor, call_one)
+
+        if not isinstance(result, dict) or result.get("silent"):
+            await interaction.followup.send("(no reply)", ephemeral=True)
+            return
+
+        agent_name = qualified.partition(".")[0]
+        replies: list[str] = []
+        if isinstance(result.get("reply"), str):
+            replies.append(result["reply"])
+        replies.extend(r for r in (result.get("replies") or []) if isinstance(r, str))
+        replies = [r for r in replies if r.strip()]
+        if not replies:
+            await interaction.followup.send("(no reply)", ephemeral=True)
+            return
+
+        for i, payload in enumerate(_reply_payloads(agent_name, replies)):
+            try:
+                if i == 0:
+                    await interaction.followup.send(payload)
+                else:
+                    await interaction.channel.send(payload)
+            except Exception as e:
+                self._log(f"app command followup failed: {e}")
+
+    async def _audit_send(self, channel_id: int, text: str) -> None:
+        """Direct send used by the audit batcher — bypasses DiscordService so
+        we don't double-bridge through run_coroutine_threadsafe (we're already
+        on the asyncio loop here)."""
+        channel = self.client.get_channel(channel_id)
+        if channel is None:
+            channel = await self.client.fetch_channel(channel_id)
+        await channel.send(text)
+
+    def _make_audit_hook(self, buffer: "_AuditBuffer"):
+        """Build an audit hook that appends to the batch buffer.
+
+        Called from dispatcher worker threads. `buffer.append` is thread-safe.
+        Formatting is done synchronously (cheap); actual Discord send is
+        coalesced by the buffer's flush loop.
+        """
+        def hook(event: dict) -> None:
+            buffer.append(_format_audit_line(event))
         return hook
 
     async def _maybe_refresh_registry(self) -> None:
@@ -322,11 +590,15 @@ class DiscordGateway:
     # dispatch -----------------------------------------------------------
 
     async def _handle(self, message) -> None:
-        channel_id = str(message.channel.id)
+        channel = message.channel
+        # If the message arrives in a thread, route subscribers by parent
+        # channel id (manifests subscribe to the parent, not per-thread).
+        # Replies stay in the thread the user wrote in.
+        parent_id = getattr(channel, "parent_id", None)
+        is_thread = parent_id is not None
+        lookup_id = str(parent_id) if is_thread else str(channel.id)
+
         await self._maybe_refresh_registry()
-        subs = self.dispatcher.registry.subscribers_for(channel_id)
-        if not subs:
-            return
 
         reply_to = (
             str(message.reference.message_id)
@@ -337,18 +609,58 @@ class DiscordGateway:
             "message": message.content,
             "user_id": str(message.author.id),
             "user_name": message.author.display_name,
-            "channel_id": channel_id,
+            "channel_id": str(channel.id),
             "guild_id": str(message.guild.id) if message.guild else "",
             "is_dm": message.guild is None,
             "message_id": str(message.id),
             "reply_to": reply_to,
         }
 
-        self._log(
-            f"channel {channel_id} -> "
-            + ", ".join(q for q, _ in subs)
-        )
-        await self._dispatch_all(subs, params, message.channel)
+        # Slash commands short-circuit channel routing: if the first word
+        # of the message matches a registered command, dispatch only to the
+        # command subscribers — channel subscribers don't also see it.
+        # Keeps `/push` in #developer from also waking up loam.respond.
+        first_word = (message.content or "").split(maxsplit=1)
+        command_subs = []
+        if first_word and first_word[0].startswith("/"):
+            command_subs = self.dispatcher.registry.command_subscribers_for(first_word[0])
+        if command_subs:
+            params = dict(params, command=first_word[0],
+                          args=first_word[1] if len(first_word) > 1 else "")
+            self._log(f"command {first_word[0]} -> " + ", ".join(q for q, _ in command_subs))
+            target = await self._reply_target(message, is_thread)
+            await self._dispatch_all(command_subs, params, target)
+            return
+
+        subs = self.dispatcher.registry.subscribers_for(lookup_id)
+        if not subs:
+            return
+        self._log(f"channel {lookup_id} -> " + ", ".join(q for q, _ in subs))
+        target = await self._reply_target(message, is_thread)
+        await self._dispatch_all(subs, params, target)
+
+    async def _reply_target(self, message, is_thread: bool):
+        """Resolve where replies should be posted.
+
+        - DM: post in the DM channel (Discord doesn't support DM threads).
+        - Already-in-a-thread: keep replies in that thread (multi-turn).
+        - Parent channel message: spawn a public thread from the user's
+          message and post replies there. Concurrent conversations get
+          their own threads instead of interleaving in the parent channel.
+
+        Falls back to the original channel if thread creation fails (e.g.
+        missing 'Create Public Threads' permission).
+        """
+        if message.guild is None or is_thread:
+            return message.channel
+        try:
+            return await message.create_thread(
+                name=_thread_name(message.content),
+                auto_archive_duration=1440,
+            )
+        except Exception as e:
+            self._log(f"thread create failed, replying in channel: {e}")
+            return message.channel
 
     async def _dispatch_all(self, subs, params, channel):
         """Dispatch every subscriber in parallel. Each may return a dict; if
@@ -385,11 +697,9 @@ class DiscordGateway:
             replies.extend(
                 r for r in (result.get("replies") or []) if isinstance(r, str)
             )
-            for text in replies:
-                if not text.strip():
-                    continue
+            for payload in _reply_payloads(agent_name, replies):
                 try:
-                    await channel.send(f"**[{agent_name}]** {text}")
+                    await channel.send(payload)
                 except Exception as e:
                     self._log(f"channel.send failed: {e}")
 

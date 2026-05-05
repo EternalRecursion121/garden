@@ -27,7 +27,7 @@ Garden is opinionated about plumbing. It is **not** opinionated about what agent
 
 | Tool | Why | Install |
 |------|-----|---------|
-| Python ≥ 3.12 | Runtime | system |
+| Python ≥ 3.11 | Runtime | system |
 | [`carry`](https://github.com/tonk-labs/carry) | Knowledge store | `cargo build --release` from source (prebuilds may have glibc mismatches) |
 | `bubblewrap` | Per-call sandbox | `apt install bubblewrap` |
 | `discord.py` | Optional, only if running the Discord gateway | `pip install discord.py` |
@@ -35,7 +35,7 @@ Garden is opinionated about plumbing. It is **not** opinionated about what agent
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install croniter pyyaml
+.venv/bin/pip install -e .
 ```
 
 ### 2. Initialise the carry repo

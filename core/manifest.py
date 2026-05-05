@@ -7,10 +7,38 @@ not declared here is the agent's private business.
 from __future__ import annotations
 
 import tomllib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .sandbox import SandboxConfig
+
+
+_COMMAND_NAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+
+def _normalize_command(token, manifest_path, fn_name):
+    """Validate a slash-command token from the manifest. Tokens must start with
+    `/` and contain a single word — the gateway matches against the first
+    whitespace-separated chunk of a Discord message."""
+    if not isinstance(token, str) or not token.startswith("/") or len(token) < 2:
+        raise ValueError(
+            f"{manifest_path}: function {fn_name!r} has invalid command "
+            f"{token!r}; want a string like '/push'"
+        )
+    if any(c.isspace() for c in token):
+        raise ValueError(
+            f"{manifest_path}: function {fn_name!r} command {token!r} "
+            f"contains whitespace; commands are single tokens"
+        )
+    name = token[1:]
+    if not _COMMAND_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"{manifest_path}: function {fn_name!r} command {token!r} "
+            "must be 1-32 chars after '/', using only lowercase letters, "
+            "digits, '_' or '-'"
+        )
+    return f"/{name}"
 
 
 @dataclass
@@ -22,6 +50,7 @@ class FunctionDef:
     params: dict[str, str] = field(default_factory=dict)
     schedule: str | None = None          # cron string
     channels: list[str] = field(default_factory=list)  # discord channel IDs (incl. DM channels)
+    commands: list[str] = field(default_factory=list)  # discord slash-command tokens, e.g. ["/push"]
     sandbox_override: bool | None = None  # None = use agent default; bool = override
     timeout: float | None = None         # seconds; only enforced for subprocess impls
     overlap: str = "skip"                # "skip" | "parallel"; scheduler-only
@@ -64,6 +93,8 @@ class AgentManifest:
                 params=entry.get("params", {}),
                 schedule=entry.get("schedule"),
                 channels=[str(c) for c in entry.get("channels", [])],
+                commands=[_normalize_command(c, manifest_path, entry.get("name"))
+                          for c in entry.get("commands", [])],
                 sandbox_override=entry.get("sandbox"),
                 timeout=float(entry["timeout"]) if entry.get("timeout") is not None else None,
                 overlap=overlap,

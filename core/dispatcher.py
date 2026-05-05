@@ -36,7 +36,7 @@ class Dispatcher:
         self.registry = registry
         self.carry = carry
         self.log = log
-        self._impl_cache: dict[str, Callable[..., Any]] = {}
+        self._impl_cache: dict[str, tuple[tuple[Any, ...], Callable[..., Any]]] = {}
         self._impl_cache_lock = threading.Lock()
         # Outbound services attached by long-running processes (gateways).
         # Functions reach them via ctx.service(name); inbound and outbound
@@ -164,11 +164,15 @@ class Dispatcher:
 
     def _load_impl(self, manifest: AgentManifest, fn: FunctionDef) -> Callable[..., Any]:
         cache_key = f"{manifest.name}.{fn.name}"
+        fingerprint = self._impl_fingerprint(manifest, fn)
         # Lock so two threads loading the same impl for the first time don't
         # both exec_module and double-fire side effects.
         with self._impl_cache_lock:
-            if cache_key in self._impl_cache:
-                return self._impl_cache[cache_key]
+            cached = self._impl_cache.get(cache_key)
+            if cached is not None:
+                cached_fingerprint, cached_impl = cached
+                if cached_fingerprint == fingerprint:
+                    return cached_impl
 
             # Per-function override wins; otherwise fall back to agent-level setting.
             agent_sandboxed = bool(manifest.sandbox.enabled)
@@ -188,8 +192,34 @@ class Dispatcher:
             else:
                 impl = self._load_python_impl(manifest, fn)
 
-            self._impl_cache[cache_key] = impl
+            self._impl_cache[cache_key] = (fingerprint, impl)
             return impl
+
+    @staticmethod
+    def _impl_fingerprint(manifest: AgentManifest, fn: FunctionDef) -> tuple[Any, ...]:
+        impl_mtime_ns = None
+        if fn.impl:
+            path_part, _, _ = fn.impl.partition(":")
+            impl_path = (manifest.folder.resolve() / path_part).resolve()
+            try:
+                impl_mtime_ns = impl_path.stat().st_mtime_ns
+            except FileNotFoundError:
+                impl_mtime_ns = None
+        sandbox = manifest.sandbox
+        return (
+            fn.impl,
+            tuple(fn.command or ()),
+            tuple(fn.params.items()),
+            fn.sandbox_override,
+            fn.timeout,
+            bool(sandbox.enabled),
+            bool(sandbox.network),
+            tuple(sandbox.env_passthrough),
+            tuple(sandbox.extra_ro_binds),
+            tuple(sandbox.extra_rw_binds),
+            sandbox.timeout,
+            impl_mtime_ns,
+        )
 
     @staticmethod
     def _load_python_impl(manifest: AgentManifest, fn: FunctionDef) -> Callable[..., Any]:
@@ -221,10 +251,11 @@ class Dispatcher:
 
         spec_name = f"_garden_{manifest.name}_{fn.name}_{impl_path.stem}"
         spec = importlib.util.spec_from_file_location(spec_name, impl_path)
-        if spec is None or spec.loader is None:
+        if spec is None:
             raise ImportError(f"cannot load {impl_path}")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        source = impl_path.read_text(encoding="utf-8")
+        exec(compile(source, str(impl_path), "exec"), module.__dict__)
 
         if not hasattr(module, func_name):
             raise AttributeError(f"{impl_path} has no function {func_name!r}")
