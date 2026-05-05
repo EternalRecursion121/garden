@@ -65,6 +65,26 @@ class Registry:
                     out.append((f"{agent_name}.{fn.name}", fn))
         return out
 
+    def inbox_subscribers_for(self, recipient: str) -> list[tuple[str, FunctionDef]]:
+        """Functions that subscribed to their agent's inbox via `inbox = true`.
+
+        For `recipient == "broadcast"` returns every inbox-subscribing function
+        across all agents. For a specific agent name, returns only that agent's
+        inbox handlers. Order is deterministic: agent name, then declaration.
+        """
+        out: list[tuple[str, FunctionDef]] = []
+        for agent_name in sorted(self.agents):
+            if recipient != "broadcast" and recipient != agent_name:
+                continue
+            m = self.agents[agent_name]
+            for fn in m.functions.values():
+                if fn.inbox:
+                    out.append((f"{agent_name}.{fn.name}", fn))
+        return out
+
+    def has_inbox_subscribers(self) -> bool:
+        return any(fn.inbox for m in self.agents.values() for fn in m.functions.values())
+
     def command_subscribers_for(self, token: str) -> list[tuple[str, FunctionDef]]:
         """Functions that registered a slash-command token via `commands = [...]`.
 

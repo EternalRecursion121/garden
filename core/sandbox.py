@@ -317,21 +317,28 @@ def make_sandboxed_python_impl(
             )
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(f"sandbox timed out after {timeout}s") from e
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"sandbox exited {proc.returncode}: {proc.stderr.strip()}"
-            )
+        # Try the error envelope first: the runner writes diagnostics to its
+        # original stdout (now `result_fd`) even on exception paths, then
+        # exits non-zero. Surfacing that beats reporting an empty stderr.
+        envelope = None
         try:
-            envelope = json.loads(proc.stdout)
-        except json.JSONDecodeError as e:
-            raise RuntimeError(
-                f"sandbox produced non-JSON output: {e}\n"
-                f"stdout: {proc.stdout!r}\nstderr: {proc.stderr!r}"
-            ) from e
-        if envelope.get("error"):
+            envelope = json.loads(proc.stdout) if proc.stdout else None
+        except json.JSONDecodeError:
+            envelope = None
+        if envelope and envelope.get("error"):
             raise RuntimeError(
                 f"{envelope['error']['type']}: {envelope['error']['message']}\n"
                 f"{envelope['error'].get('traceback', '')}"
+            )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"sandbox exited {proc.returncode}: "
+                f"stderr={proc.stderr.strip()!r} stdout={proc.stdout.strip()!r}"
+            )
+        if envelope is None:
+            raise RuntimeError(
+                f"sandbox produced non-JSON output: "
+                f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
             )
         return envelope.get("result")
 

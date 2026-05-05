@@ -16,6 +16,59 @@ from .sandbox import SandboxConfig
 
 _COMMAND_NAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 
+# Allowed param-type tokens (with optional trailing '?' for "may be missing
+# or None"). Keep this set small and predictable: validated at manifest-load
+# time so typos in agent.toml fail there, and re-used by the dispatcher to
+# type-check inbound params before invoking the impl.
+_PARAM_TYPES: set[str] = {"string", "int", "float", "bool", "list", "dict", "any"}
+
+
+def _split_param_spec(spec: str) -> tuple[str, bool]:
+    """Return (base_type, optional). Doesn't validate — see _validate_param_spec."""
+    optional = spec.endswith("?")
+    return (spec[:-1] if optional else spec), optional
+
+
+def _validate_param_spec(spec, name, fn_name, manifest_path) -> None:
+    if not isinstance(spec, str) or not spec:
+        raise ValueError(
+            f"{manifest_path}: function {fn_name!r} param {name!r} type must be a "
+            f"non-empty string, got {spec!r}"
+        )
+    base, _ = _split_param_spec(spec)
+    if base not in _PARAM_TYPES:
+        raise ValueError(
+            f"{manifest_path}: function {fn_name!r} param {name!r} has unknown "
+            f"type {spec!r}; want one of {sorted(_PARAM_TYPES)} "
+            f"(append '?' to mark optional)"
+        )
+
+
+def param_value_matches(value, spec: str) -> bool:
+    """True if `value` satisfies the manifest type token. `?`-optional is
+    handled by the caller; this checks the base type only.
+
+    Strict on bool/int boundary (bool isn't accepted as int, even though Python
+    says `isinstance(True, int)`) — that's a subtle footgun and `int` should
+    mean a real integer."""
+    base, _ = _split_param_spec(spec)
+    if base == "any":
+        return True
+    if base == "string":
+        return isinstance(value, str)
+    if base == "int":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if base == "float":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if base == "bool":
+        return isinstance(value, bool)
+    if base == "list":
+        return isinstance(value, list)
+    if base == "dict":
+        return isinstance(value, dict)
+    # Unreachable: _validate_param_spec rejects unknown bases at load time.
+    return True
+
 
 def _normalize_command(token, manifest_path, fn_name):
     """Validate a slash-command token from the manifest. Tokens must start with
@@ -51,6 +104,7 @@ class FunctionDef:
     schedule: str | None = None          # cron string
     channels: list[str] = field(default_factory=list)  # discord channel IDs (incl. DM channels)
     commands: list[str] = field(default_factory=list)  # discord slash-command tokens, e.g. ["/push"]
+    inbox: bool = False                  # subscribe to garden.message addressed to this agent (+ broadcast)
     sandbox_override: bool | None = None  # None = use agent default; bool = override
     timeout: float | None = None         # seconds; only enforced for subprocess impls
     overlap: str = "skip"                # "skip" | "parallel"; scheduler-only
@@ -85,16 +139,20 @@ class AgentManifest:
                     f"{manifest_path}: function {entry.get('name')!r} has invalid "
                     f"overlap={overlap!r}; want 'skip' or 'parallel'"
                 )
+            params = entry.get("params", {}) or {}
+            for pname, pspec in params.items():
+                _validate_param_spec(pspec, pname, entry.get("name"), manifest_path)
             fn = FunctionDef(
                 name=entry["name"],
                 description=entry.get("description", ""),
                 impl=entry.get("impl"),
                 command=entry.get("command"),
-                params=entry.get("params", {}),
+                params=params,
                 schedule=entry.get("schedule"),
                 channels=[str(c) for c in entry.get("channels", [])],
                 commands=[_normalize_command(c, manifest_path, entry.get("name"))
                           for c in entry.get("commands", [])],
+                inbox=bool(entry.get("inbox", False)),
                 sandbox_override=entry.get("sandbox"),
                 timeout=float(entry["timeout"]) if entry.get("timeout") is not None else None,
                 overlap=overlap,

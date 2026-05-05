@@ -171,8 +171,11 @@ def send_message(
     msg_id = uuid.uuid4().hex
     # `from` is a Python keyword; pass via dict-unpacking. Field names use
     # kebab-case because carry's attribute namespace forbids underscores.
+    # Field is named `msg-id`, not `id`, because carry's `--format json`
+    # output uses `id` for the entity DID. A user-asserted `id` field
+    # shadows it, breaking entity lookups (e.g. mark_delivered).
     carry.assert_("garden.message", **{
-        "id": msg_id,
+        "msg-id": msg_id,
         "from": _agent_of(ctx),
         "to": recipient,
         "subject": subject,
@@ -192,9 +195,15 @@ def fetch_inbox(
 ) -> list[dict[str, Any]]:
     """Return undelivered messages addressed to the running agent (and
     optionally broadcasts). Caller is responsible for marking them
-    delivered."""
+    delivered.
+
+    This is the pull path. Most agents should prefer the push path: declare
+    `inbox = true` on a function and the runtime's InboxWatcher dispatches
+    each undelivered message to it (and marks delivered after dispatch). Use
+    fetch_inbox only when you need agent-controlled batching or scheduling.
+    """
     rows = carry.query(
-        "garden.message", "id", "from", "to", "subject", "body",
+        "garden.message", "msg-id", "from", "to", "subject", "body",
         "in-reply-to", "delivered", "created-at",
     )
     recipient = _agent_of(ctx)

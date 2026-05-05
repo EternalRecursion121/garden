@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional
 from utils.carry import Carry, CarryError
 from utils.context import Context
 
-from .manifest import AgentManifest, FunctionDef
+from .manifest import AgentManifest, FunctionDef, _split_param_spec, param_value_matches
 from .registry import Registry
 
 
@@ -158,9 +158,22 @@ class Dispatcher:
     @staticmethod
     def _validate_params(qualified: str, fn: FunctionDef, params: dict) -> None:
         for key, type_str in fn.params.items():
-            optional = type_str.endswith("?")
-            if not optional and key not in params:
-                raise ValueError(f"{qualified}: missing required param {key!r}")
+            base, optional = _split_param_spec(type_str)
+            if key not in params:
+                if not optional:
+                    raise ValueError(f"{qualified}: missing required param {key!r}")
+                continue
+            value = params[key]
+            # Optional params accept None as "absent" — keeps callers like the
+            # Discord gateway, which passes `reply_to: None` when a message
+            # isn't a reply, working without per-callsite coalescing.
+            if optional and value is None:
+                continue
+            if not param_value_matches(value, type_str):
+                raise TypeError(
+                    f"{qualified}: param {key!r} expected {base}, got "
+                    f"{type(value).__name__}={value!r}"
+                )
 
     def _load_impl(self, manifest: AgentManifest, fn: FunctionDef) -> Callable[..., Any]:
         cache_key = f"{manifest.name}.{fn.name}"

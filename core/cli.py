@@ -19,6 +19,7 @@ from pathlib import Path
 from utils.carry import Carry
 
 from .dispatcher import Dispatcher
+from .inbox import InboxWatcher
 from .registry import Registry
 from .scheduler import Scheduler
 
@@ -69,7 +70,12 @@ def cmd_list(args: argparse.Namespace) -> int:
         desc = f" — {m.description}" if m.description else ""
         print(f"{name}{desc}")
         for fn in m.functions.values():
-            sched = f"  [cron: {fn.schedule}]" if fn.schedule else ""
+            triggers = []
+            if fn.schedule:
+                triggers.append(f"cron: {fn.schedule}")
+            if fn.inbox:
+                triggers.append("inbox")
+            sched = f"  [{', '.join(triggers)}]" if triggers else ""
             params = ", ".join(f"{k}: {v}" for k, v in fn.params.items())
             params_str = f"({params})" if params else "()"
             fdesc = f" — {fn.description}" if fn.description else ""
@@ -87,11 +93,18 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_schedule(args: argparse.Namespace) -> int:
+    import threading
+
     cfg = _load_config()
     poll = args.poll if args.poll is not None else cfg.get("scheduler", {}).get(
         "poll_interval", 30
     )
     dispatcher = _make_dispatcher()
+    # Inbox watcher rides along with the scheduler process: same dispatcher,
+    # separate poll loop and worker pool so a slow inbox handler doesn't push
+    # cron fires off-clock. Daemon thread so it dies with the main loop.
+    inbox = InboxWatcher(dispatcher, poll_interval=float(poll))
+    threading.Thread(target=inbox.run, name="garden-inbox", daemon=True).start()
     Scheduler(dispatcher, poll_interval=float(poll)).run()
     return 0
 
