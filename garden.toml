@@ -7,3 +7,7 @@ repo = "data"
 [scheduler]
 # Seconds between cron polls.
 poll_interval = 30
+
+[gateway.discord]
+# Default 5min message-id dedup window for handling Discord RESUME replays.
+dedup_ttl = 300

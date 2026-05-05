@@ -43,6 +43,12 @@ class Dispatcher:
         # are independent — a function subscribed to a Discord channel does
         # not auto-emit through Discord.
         self.services: dict[str, Any] = {}
+        # Optional hook invoked after every call() completes (success or
+        # failure). Signature: (event: dict) -> None. Long-running processes
+        # (e.g. the Discord gateway) wire this to mirror the carry run-log
+        # to a side channel. Failures inside the hook are caught so a broken
+        # audit pipeline can't break dispatch.
+        self.audit_hook: Optional[Callable[[dict], None]] = None
 
     # public entrypoint --------------------------------------------------
 
@@ -82,26 +88,43 @@ class Dispatcher:
         try:
             impl = self._load_impl(manifest, fn)
             result = impl(params, ctx)
-            self._record_run_end(run_id, "ok", time.time() - started, result=result)
+            duration = time.time() - started
+            self._record_run_end(run_id, "ok", duration, result=result)
             if self.log:
-                print(
-                    f"{indent}✓ {qualified} [{run_id[:8]}] in {time.time() - started:.2f}s",
-                    flush=True,
-                )
+                print(f"{indent}✓ {qualified} [{run_id[:8]}] in {duration:.2f}s", flush=True)
+            self._fire_audit({
+                "qualified": qualified, "run_id": run_id, "parent_run_id": parent_run_id,
+                "depth": depth, "scope": scope, "status": "ok", "duration": duration,
+                "params": params, "result": result, "error": None,
+            })
             return result
         except Exception as e:
+            duration = time.time() - started
             self._record_run_end(
-                run_id,
-                "error",
-                time.time() - started,
+                run_id, "error", duration,
                 error=f"{type(e).__name__}: {e}",
                 traceback=traceback.format_exc(),
             )
             if self.log:
                 print(f"{indent}✗ {qualified} [{run_id[:8]}]: {e}", flush=True)
+            self._fire_audit({
+                "qualified": qualified, "run_id": run_id, "parent_run_id": parent_run_id,
+                "depth": depth, "scope": scope, "status": "error", "duration": duration,
+                "params": params, "result": None, "error": f"{type(e).__name__}: {e}",
+            })
             raise
 
     # internals ----------------------------------------------------------
+
+    def _fire_audit(self, event: dict) -> None:
+        hook = self.audit_hook
+        if hook is None:
+            return
+        try:
+            hook(event)
+        except Exception as e:
+            if self.log:
+                print(f"[audit] hook raised: {e}", file=sys.stderr, flush=True)
 
     def _dispatch_from_ctx(
         self,
@@ -186,10 +209,15 @@ class Dispatcher:
             raise FileNotFoundError(f"impl not found: {impl_path}")
 
         # Make the agent folder importable so the impl can `import functions.foo`
-        # or its own siblings.
+        # or its own siblings. Also add the impl's directory so it can
+        # `from _lib import ...` like the sandbox harness allows — keeps
+        # sandboxed/unsandboxed import behaviour consistent.
         agent_str = str(manifest.folder.resolve())
         if agent_str not in sys.path:
             sys.path.insert(0, agent_str)
+        impl_dir = str(impl_path.parent)
+        if impl_dir not in sys.path:
+            sys.path.insert(0, impl_dir)
 
         spec_name = f"_garden_{manifest.name}_{fn.name}_{impl_path.stem}"
         spec = importlib.util.spec_from_file_location(spec_name, impl_path)

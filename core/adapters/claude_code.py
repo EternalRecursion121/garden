@@ -73,6 +73,7 @@ class ClaudeCode:
         session_id: str | None = None,
         exclude_dynamic_sections: bool = True,
         autocompact_pct: int | None = None,
+        extra_args: list[str] | None = None,
     ):
         self.model = model
         self.allowed_tools = allowed_tools or []
@@ -81,6 +82,8 @@ class ClaudeCode:
         self.session_id = session_id
         self.exclude_dynamic_sections = exclude_dynamic_sections
         self.autocompact_pct = autocompact_pct
+        # Forwarded verbatim to claude (e.g. ['--dangerously-skip-permissions']).
+        self.extra_args = list(extra_args or [])
         if shutil.which(self.bin) is None:
             raise RuntimeError(f"`{self.bin}` CLI not found in PATH")
 
@@ -110,6 +113,8 @@ class ClaudeCode:
             argv += ["--model", self.model]
         if self.allowed_tools:
             argv += ["--allowedTools", ",".join(self.allowed_tools)]
+        if self.extra_args:
+            argv += list(self.extra_args)
         argv += ["--", prompt]
         return argv
 

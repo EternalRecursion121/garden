@@ -172,6 +172,7 @@ class DiscordGateway:
         max_parallel: int = 8,
         dedup_ttl: float = 300.0,
         refresh_interval: float = 5.0,
+        audit_channel_id: Optional[int] = None,
         log: bool = True,
     ):
         if discord is None:
@@ -192,6 +193,7 @@ class DiscordGateway:
         self.allowed_dm_users = allowed_dm_users
         self.ignore_bots = ignore_bots
         self.max_parallel = max_parallel
+        self.audit_channel_id = audit_channel_id
         self.log = log
         self._dedup = MessageDeduplicator(ttl_seconds=dedup_ttl)
         # Shared across all messages so we don't pay thread-pool startup per
@@ -232,6 +234,10 @@ class DiscordGateway:
                 and message.guild is not None
                 and message.guild.id not in self.allowed_guilds
             ):
+                self._log(
+                    f"dropping message from guild {message.guild.id} "
+                    f"({message.guild.name!r}) — not in DISCORD_GUILD_IDS"
+                )
                 return
             # DM allow-list: drop DMs from anyone not on the list. With no
             # list configured, all DMs are dropped (no "anyone with the bot's
@@ -250,9 +256,58 @@ class DiscordGateway:
             await self._handle(message)
 
     def _register_service(self) -> None:
-        self.dispatcher.services["discord"] = DiscordService(
-            self.client, self.client.loop, log=self._log
-        )
+        service = DiscordService(self.client, self.client.loop, log=self._log)
+        self.dispatcher.services["discord"] = service
+        if self.audit_channel_id is not None:
+            self.dispatcher.audit_hook = self._make_audit_hook(service)
+            self._log(f"audit channel: {self.audit_channel_id}")
+
+    def _make_audit_hook(self, service: "DiscordService"):
+        """Build a fire-and-forget audit hook bound to the discord service.
+
+        Hook is called from worker threads (the dispatcher runs impls under
+        the gateway's executor). DiscordService.send already bridges back
+        to the asyncio loop, so there's no extra threading work here. We
+        keep the formatting minimal — one line per call.
+        """
+        channel_id = self.audit_channel_id
+
+        def fmt_preview(value, limit: int = 120) -> str:
+            try:
+                s = value if isinstance(value, str) else __import__("json").dumps(value, default=str)
+            except Exception:
+                s = str(value)
+            s = s.replace("\n", " ").replace("\r", " ")
+            return s if len(s) <= limit else s[: limit - 1] + "…"
+
+        def hook(event: dict) -> None:
+            icon = "✓" if event.get("status") == "ok" else "✗"
+            qualified = event.get("qualified", "?")
+            run_id = (event.get("run_id") or "")[:8]
+            duration = event.get("duration", 0.0)
+            depth = int(event.get("depth", 0))
+            indent = "·" * depth
+            params = event.get("params") or {}
+            tail = (
+                f"err: {fmt_preview(event.get('error'), 200)}"
+                if event.get("status") != "ok"
+                else fmt_preview(event.get("result"))
+            )
+            params_preview = fmt_preview(params, 80) if params else ""
+            line = (
+                f"`{icon} {indent}{qualified} [{run_id}] {duration:.2f}s`"
+                + (f"  in: {params_preview}" if params_preview else "")
+                + (f"  → {tail}" if tail else "")
+            )
+            # Discord hard-caps at 2000 chars; trim defensively.
+            if len(line) > 1900:
+                line = line[:1899] + "…"
+            try:
+                service.send(channel_id=channel_id, text=line)
+            except Exception as e:
+                self._log(f"audit send failed: {e}")
+
+        return hook
 
     async def _maybe_refresh_registry(self) -> None:
         """Refresh the registry at most once per `_refresh_interval`. The scan
@@ -304,7 +359,8 @@ class DiscordGateway:
 
         Uses the gateway-wide executor — concurrent messages compete for the
         same `max_parallel` worker budget rather than each spawning their own
-        pool."""
+        pool. Shows a typing indicator in the channel for the duration of
+        the dispatch (discord.py refreshes every 5s automatically)."""
         loop = asyncio.get_running_loop()
 
         def call_one(qualified: str):
@@ -314,9 +370,10 @@ class DiscordGateway:
                 self._log(f"{qualified} raised: {e}")
                 return qualified, None
 
-        results = await asyncio.gather(
-            *(loop.run_in_executor(self._executor, call_one, qualified) for qualified, _ in subs)
-        )
+        async with channel.typing():
+            results = await asyncio.gather(
+                *(loop.run_in_executor(self._executor, call_one, qualified) for qualified, _ in subs)
+            )
 
         for qualified, result in results:
             if not isinstance(result, dict) or result.get("silent"):
@@ -369,26 +426,34 @@ class DiscordGateway:
 def from_config(dispatcher: Dispatcher, cfg: dict) -> DiscordGateway:
     """Build a gateway from a `[gateway.discord]` table in garden.toml.
 
-    Recognized keys:
-      allowed_guilds    list[int] — restrict to specific guilds (optional)
+    Token from `DISCORD_TOKEN` env var. Guild allowlist from
+    `DISCORD_GUILD_IDS` env var (comma-separated ints). Both live in
+    `.env`, never in committed config.
+
+    Recognized toml keys (all optional):
       allowed_dm_users  list[int] — user IDs allowed to DM the bot. Omit/empty
                         ⇒ all DMs dropped (default; safer than "anyone").
-      token_env         env var holding the bot token (default DISCORD_TOKEN)
       dedup_ttl         seconds to remember message ids (default 300)
     """
-    token_env = cfg.get("token_env", "DISCORD_TOKEN")
-    token = os.environ.get(token_env, "")
+    token = os.environ.get("DISCORD_TOKEN", "")
     if not token:
         raise RuntimeError(
-            f"{token_env} is unset; export it before starting the gateway"
+            "DISCORD_TOKEN is unset; export it before starting the gateway"
         )
+    raw_guilds = os.environ.get("DISCORD_GUILD_IDS", "").strip()
+    allowed_guilds: Optional[set[int]] = None
+    if raw_guilds:
+        allowed_guilds = {int(g) for g in raw_guilds.split(",") if g.strip()}
+    raw_audit = os.environ.get("DISCORD_AUDIT_CHANNEL_ID", "").strip()
+    audit_channel_id = int(raw_audit) if raw_audit else None
     return DiscordGateway(
         dispatcher,
         token=token,
-        allowed_guilds=set(cfg["allowed_guilds"]) if cfg.get("allowed_guilds") else None,
+        allowed_guilds=allowed_guilds,
         allowed_dm_users=(
             set(int(u) for u in cfg["allowed_dm_users"])
             if cfg.get("allowed_dm_users") else None
         ),
         dedup_ttl=float(cfg.get("dedup_ttl", 300)),
+        audit_channel_id=audit_channel_id,
     )

@@ -250,6 +250,11 @@ def build_bwrap_argv(
         "--setenv", "PYTHONPATH", str(garden_root),
         "--setenv", "GARDEN_ROOT", str(garden_root),
         "--setenv", "GARDEN_AGENT_SCRATCH", str(scratch_dir),
+        # Pin git's global config to the scratch dir even when the manifest
+        # passes HOME through (which agents do so claude code finds ~/.claude).
+        # Without this, git would look at /root/.gitconfig — which isn't bound
+        # — and commits would fail with "please tell me who you are".
+        "--setenv", "GIT_CONFIG_GLOBAL", str(scratch_dir / ".gitconfig"),
     ]
     for name in cfg.env_passthrough:
         val = os.environ.get(name)
