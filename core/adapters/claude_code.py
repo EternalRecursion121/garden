@@ -36,11 +36,29 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 import uuid as _uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from .base import Result
+
+
+# Per-session-id mutex registry. Two concurrent invokes against the same
+# session id would race on the session JSONL (one --resume locks/corrupts
+# it for the other). Serialize them. Different session ids run in parallel.
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+def _lock_for_session(session_id: str) -> threading.Lock:
+    with _session_locks_guard:
+        lock = _session_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _session_locks[session_id] = lock
+        return lock
 
 
 def stable_session_id(scope: str) -> str:
@@ -127,49 +145,55 @@ class ClaudeCode:
         fork_on_overflow: bool = True,
         **kwargs: Any,
     ) -> Result:
-        cmd = self._build_argv(
-            prompt=prompt,
-            system=system,
-            session_id=self.session_id,
-            resume=bool(self.session_id) and _session_exists(self.session_id, self.cwd),
-        )
-
         env = os.environ.copy()
         if self.autocompact_pct is not None:
             env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(self.autocompact_pct)
 
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=self.cwd,
-            check=False,
-            timeout=timeout,
-            env=env,
-        )
-        if proc.returncode != 0:
-            stderr = proc.stderr or ""
-            if fork_on_overflow and self.session_id and (
-                "context" in stderr.lower() or "too long" in stderr.lower()
-            ):
-                # Resumed context is over the model limit — fork into a fresh
-                # session-id and retry once. The new session is empty so the
-                # prompt cache primes and continuity carries forward via the
-                # auto-compact summary that claude wrote before failure.
-                forked = stable_session_id(
-                    f"{self.session_id}/fork-{int(__import__('time').time())}"
-                )
-                fork_cmd = self._build_argv(
-                    prompt=prompt,
-                    system=system,
-                    session_id=forked,
-                    resume=False,  # new id, no on-disk session yet
-                )
-                proc = subprocess.run(
-                    fork_cmd, capture_output=True, text=True,
-                    cwd=self.cwd, check=False, timeout=timeout, env=env,
-                )
-                if proc.returncode == 0:
-                    return Result(text=proc.stdout, raw={"forked_session": forked})
-            raise RuntimeError(f"claude exited {proc.returncode}: {stderr}")
-        return Result(text=proc.stdout)
+        # Hold the per-session lock for the entire subprocess lifetime so two
+        # concurrent invokes with the same session id queue rather than race
+        # on the session JSONL. The lock guards only the subprocess.run call;
+        # we recompute `resume` *inside* the lock because a sibling call may
+        # have just created the on-disk session.
+        lock = _lock_for_session(self.session_id) if self.session_id else None
+        with (lock if lock is not None else nullcontext()):
+            cmd = self._build_argv(
+                prompt=prompt,
+                system=system,
+                session_id=self.session_id,
+                resume=bool(self.session_id) and _session_exists(self.session_id, self.cwd),
+            )
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.cwd,
+                check=False,
+                timeout=timeout,
+                env=env,
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr or ""
+                if fork_on_overflow and self.session_id and (
+                    "context" in stderr.lower() or "too long" in stderr.lower()
+                ):
+                    # Resumed context is over the model limit — fork into a fresh
+                    # session-id and retry once. The new session is empty so the
+                    # prompt cache primes and continuity carries forward via the
+                    # auto-compact summary that claude wrote before failure.
+                    forked = stable_session_id(
+                        f"{self.session_id}/fork-{int(__import__('time').time())}"
+                    )
+                    fork_cmd = self._build_argv(
+                        prompt=prompt,
+                        system=system,
+                        session_id=forked,
+                        resume=False,  # new id, no on-disk session yet
+                    )
+                    proc = subprocess.run(
+                        fork_cmd, capture_output=True, text=True,
+                        cwd=self.cwd, check=False, timeout=timeout, env=env,
+                    )
+                    if proc.returncode == 0:
+                        return Result(text=proc.stdout, raw={"forked_session": forked})
+                raise RuntimeError(f"claude exited {proc.returncode}: {stderr}")
+            return Result(text=proc.stdout)
