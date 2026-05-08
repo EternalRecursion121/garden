@@ -66,7 +66,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Callable, Optional
 
 from ..dispatcher import Dispatcher
 
@@ -247,6 +247,144 @@ class _AuditBuffer:
                     self._log(f"audit flush failed: {e}")
 
 
+# --- error alerts --------------------------------------------------------
+
+
+class _ErrorAlerter:
+    """DM the configured owner when dispatcher calls error out, with two
+    forms of loop prevention:
+
+      * **Per-signature dedup** (`qualified` + error type prefix): the same
+        signature within `DEDUP_WINDOW` doesn't re-DM; we count and report
+        the run-up the next time that signature does send.
+      * **Global circuit-breaker**: more than `GLOBAL_THRESHOLD` errors in
+        the last `GLOBAL_WINDOW` seconds → mute *all* alerts for
+        `MUTE_DURATION`. The trip itself is one DM ("circuit-breaker
+        tripped"); when the mute expires we DM one recap with how many
+        events were suppressed.
+
+    The threshold + windows are tuned for "deeply broken" detection — a
+    single misbehaving cron firing every minute won't trip it; a 1-second
+    error storm will. Tweak as needed.
+
+    Failures inside the alerter (e.g. DM API hiccups) are caught upstream
+    by `Dispatcher._fire_audit`, so a broken alert pipeline can't break
+    dispatch. We additionally keep the alerter purely thread-safe (no
+    asyncio entry from worker threads — `dm_send` does the bridging).
+    """
+
+    GLOBAL_WINDOW: float = 60.0
+    GLOBAL_THRESHOLD: int = 5
+    MUTE_DURATION: float = 300.0
+    DEDUP_WINDOW: float = 30.0
+    PREVIEW_LIMIT: int = 240
+
+    def __init__(self, owner_id: int, dm_send, log):
+        self._owner_id = int(owner_id)
+        self._dm_send = dm_send  # sync callable: (user_id, text) -> None
+        self._log = log
+        self._lock = threading.Lock()
+        self._error_times: list[float] = []
+        self._muted_until: float = 0.0
+        self._suppressed_during_mute: int = 0
+        self._sig_last_sent: dict[str, float] = {}
+        self._sig_pending_count: dict[str, int] = {}
+
+    def on_event(self, event: dict) -> None:
+        if event.get("status") != "error":
+            return
+        now = time.time()
+        action: tuple[str, str] | None = None
+        with self._lock:
+            # Sliding window of recent errors.
+            self._error_times = [
+                t for t in self._error_times if now - t <= self.GLOBAL_WINDOW
+            ]
+            self._error_times.append(now)
+
+            # Already muted: count and bail. The unmute timer DMs the recap.
+            if now < self._muted_until:
+                self._suppressed_during_mute += 1
+                return
+
+            # Trip circuit-breaker if we just blew past the threshold.
+            if len(self._error_times) > self.GLOBAL_THRESHOLD:
+                self._muted_until = now + self.MUTE_DURATION
+                self._suppressed_during_mute = 0
+                action = (
+                    "trip",
+                    self._format_breaker(event, len(self._error_times)),
+                )
+                # Schedule the unmute recap. Daemon thread so it doesn't
+                # block process shutdown if the gateway dies.
+                t = threading.Timer(self.MUTE_DURATION + 1.0, self._flush_unmute)
+                t.daemon = True
+                t.start()
+            else:
+                # Per-signature dedup.
+                sig = self._signature(event)
+                last = self._sig_last_sent.get(sig, 0.0)
+                if now - last < self.DEDUP_WINDOW:
+                    self._sig_pending_count[sig] = (
+                        self._sig_pending_count.get(sig, 0) + 1
+                    )
+                    return
+                pending = self._sig_pending_count.pop(sig, 0)
+                self._sig_last_sent[sig] = now
+                action = ("alert", self._format_alert(event, pending))
+
+        # Outside the lock for the network call.
+        if action is not None:
+            self._send(action[1])
+
+    def _flush_unmute(self) -> None:
+        with self._lock:
+            count = self._suppressed_during_mute
+            self._suppressed_during_mute = 0
+            self._muted_until = 0.0
+            self._error_times.clear()
+        self._send(
+            f"✓ garden alerts un-muted"
+            + (f" — {count} events suppressed during mute window." if count else ".")
+        )
+
+    def _send(self, text: str) -> None:
+        try:
+            self._dm_send(self._owner_id, text[:1900])
+        except Exception as e:
+            self._log(f"error-alerter dm failed: {e}")
+
+    @staticmethod
+    def _signature(event: dict) -> str:
+        err = event.get("error") or ""
+        err_type = err.split(":", 1)[0].strip()
+        return f"{event.get('qualified', '?')}::{err_type}"
+
+    def _format_error(self, event: dict) -> str:
+        err = (event.get("error") or "").replace("\n", " ").replace("\r", " ")
+        return err[: self.PREVIEW_LIMIT]
+
+    def _format_alert(self, event: dict, pending: int) -> str:
+        run_id = (event.get("run_id") or "")[:8]
+        body = (
+            f"⚠️ `{event.get('qualified', '?')}` [{run_id}] failed "
+            f"after {float(event.get('duration', 0) or 0):.1f}s\n"
+            f"```{self._format_error(event)}```"
+        )
+        if pending > 0:
+            body += f"\n(+{pending} similar in last {int(self.DEDUP_WINDOW)}s)"
+        return body
+
+    def _format_breaker(self, event: dict, count_in_window: int) -> str:
+        return (
+            f"🚨 garden circuit-breaker tripped: "
+            f"{count_in_window} errors in last {int(self.GLOBAL_WINDOW)}s. "
+            f"Muting alerts for {int(self.MUTE_DURATION / 60)}min.\n"
+            f"Latest: `{event.get('qualified', '?')}` — "
+            f"{self._format_error(event)}"
+        )
+
+
 def _thread_name(content: str, fallback: str = "conversation") -> str:
     """Build a Discord thread name from a message body.
 
@@ -294,6 +432,7 @@ class DiscordGateway:
         dedup_ttl: float = 300.0,
         refresh_interval: float = 5.0,
         audit_channel_id: Optional[int] = None,
+        owner_user_id: Optional[int] = None,
         log: bool = True,
     ):
         if discord is None:
@@ -315,6 +454,10 @@ class DiscordGateway:
         self.ignore_bots = ignore_bots
         self.max_parallel = max_parallel
         self.audit_channel_id = audit_channel_id
+        # If set, dispatcher errors trigger a DM to this user with
+        # circuit-breaker + dedup. Unset ⇒ no extra alerts (audit channel
+        # mirror still runs if configured).
+        self.owner_user_id = owner_user_id
         self.log = log
         self._dedup = MessageDeduplicator(ttl_seconds=dedup_ttl)
         # Shared across all messages so we don't pay thread-pool startup per
@@ -323,6 +466,18 @@ class DiscordGateway:
         self._executor = ThreadPoolExecutor(
             max_workers=max_parallel, thread_name_prefix="garden-gw-discord"
         )
+        # Per-conversation asyncio.Lock to serialize sequential inbound
+        # messages within an existing thread or DM. discord.py spawns a task
+        # per on_message, so two near-simultaneous messages in one thread run
+        # their handlers concurrently and race on the downstream session
+        # JSONL. The adapter's per-session threading.Lock is mutex but not
+        # FIFO, so msg2 can land before msg1. asyncio.Lock acquisition *is*
+        # FIFO, so locking here keeps within-thread order. The lock is keyed
+        # by the message's own channel.id and is *only* taken for thread/DM
+        # messages — top-level parent-channel messages each spawn their own
+        # new thread (independent conversation) and must not serialize on
+        # the shared parent id.
+        self._channel_locks: dict[str, asyncio.Lock] = {}
         # Debounce registry refresh: file-system scan on every Discord message
         # blocks the event loop and wastes work. `refresh_interval` is the
         # minimum gap between scans.
@@ -386,15 +541,46 @@ class DiscordGateway:
     def _register_service(self) -> None:
         service = DiscordService(self.client, self.client.loop, log=self._log)
         self.dispatcher.services["discord"] = service
+
+        # Build a chain of audit-hook subscribers. The dispatcher exposes a
+        # single `audit_hook` slot, so we wrap multiple consumers into one
+        # callable. Each consumer is wrapped in a try/except so a flaky one
+        # can't starve the others.
+        hooks: list[Callable[[dict], None]] = []
         if self.audit_channel_id is not None:
             self._audit_buffer = _AuditBuffer(
                 channel_id=self.audit_channel_id,
                 send_async=self._audit_send,
                 log=self._log,
             )
-            self.dispatcher.audit_hook = self._make_audit_hook(self._audit_buffer)
+            hooks.append(
+                lambda event: self._audit_buffer.append(_format_audit_line(event))
+            )
             asyncio.create_task(self._audit_buffer.run_forever())
             self._log(f"audit channel: {self.audit_channel_id}")
+
+        if self.owner_user_id is not None:
+            self._error_alerter = _ErrorAlerter(
+                owner_id=self.owner_user_id,
+                # service.dm is sync (fire-and-forget) — safe to call from
+                # the dispatcher worker threads where the audit hook fires.
+                dm_send=lambda uid, text: service.dm(user_id=uid, text=text),
+                log=self._log,
+            )
+            hooks.append(self._error_alerter.on_event)
+            self._log(f"error alerts: DMing {self.owner_user_id}")
+
+        if hooks:
+            log = self._log
+
+            def chain(event: dict) -> None:
+                for h in hooks:
+                    try:
+                        h(event)
+                    except Exception as e:
+                        log(f"audit hook raised: {e}")
+
+            self.dispatcher.audit_hook = chain
 
     # app commands ------------------------------------------------------
 
@@ -566,17 +752,6 @@ class DiscordGateway:
             channel = await self.client.fetch_channel(channel_id)
         await channel.send(text)
 
-    def _make_audit_hook(self, buffer: "_AuditBuffer"):
-        """Build an audit hook that appends to the batch buffer.
-
-        Called from dispatcher worker threads. `buffer.append` is thread-safe.
-        Formatting is done synchronously (cheap); actual Discord send is
-        coalesced by the buffer's flush loop.
-        """
-        def hook(event: dict) -> None:
-            buffer.append(_format_audit_line(event))
-        return hook
-
     async def _maybe_refresh_registry(self) -> None:
         """Refresh the registry at most once per `_refresh_interval`. The scan
         walks the agents directory, so we don't want to do it on the asyncio
@@ -589,7 +764,35 @@ class DiscordGateway:
 
     # dispatch -----------------------------------------------------------
 
+    def _channel_lock(self, channel_id: str) -> asyncio.Lock:
+        """Return (lazily creating) the asyncio.Lock for this channel id.
+
+        Created lazily because asyncio.Lock binds to the running loop, and
+        __init__ runs before client.run starts the loop. Threads count as
+        their own channel.id, so each Discord thread gets its own lock.
+        """
+        lock = self._channel_locks.get(channel_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._channel_locks[channel_id] = lock
+        return lock
+
     async def _handle(self, message) -> None:
+        # Lock only for *continuing* conversations: messages inside an existing
+        # thread (per-thread channel.id) or a DM. Top-level messages in a parent
+        # channel each spawn their own new thread in `_reply_target`, so they
+        # have independent sessions — locking on the shared parent channel.id
+        # would needlessly serialize unrelated conversations.
+        channel = message.channel
+        is_thread = getattr(channel, "parent_id", None) is not None
+        is_dm = message.guild is None
+        if is_thread or is_dm:
+            async with self._channel_lock(str(channel.id)):
+                await self._handle_locked(message)
+        else:
+            await self._handle_locked(message)
+
+    async def _handle_locked(self, message) -> None:
         channel = message.channel
         # If the message arrives in a thread, route subscribers by parent
         # channel id (manifests subscribe to the parent, not per-thread).
@@ -756,6 +959,8 @@ def from_config(dispatcher: Dispatcher, cfg: dict) -> DiscordGateway:
         allowed_guilds = {int(g) for g in raw_guilds.split(",") if g.strip()}
     raw_audit = os.environ.get("DISCORD_AUDIT_CHANNEL_ID", "").strip()
     audit_channel_id = int(raw_audit) if raw_audit else None
+    raw_owner = os.environ.get("DISCORD_OWNER_ID", "").strip()
+    owner_user_id = int(raw_owner) if raw_owner else None
     return DiscordGateway(
         dispatcher,
         token=token,
@@ -766,4 +971,5 @@ def from_config(dispatcher: Dispatcher, cfg: dict) -> DiscordGateway:
         ),
         dedup_ttl=float(cfg.get("dedup_ttl", 300)),
         audit_channel_id=audit_channel_id,
+        owner_user_id=owner_user_id,
     )
