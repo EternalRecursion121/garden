@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import tomllib
 from pathlib import Path
@@ -100,12 +101,35 @@ def cmd_schedule(args: argparse.Namespace) -> int:
         "poll_interval", 30
     )
     dispatcher = _make_dispatcher()
+
+    # Shutdown coordination: signal handlers set an event that both the inbox
+    # watcher and scheduler check. On SIGTERM/SIGINT, both stop accepting new
+    # work and wait for in-flight dispatches to finish.
+    shutdown_event = threading.Event()
+
+    def _on_shutdown(signum: int, frame: object) -> None:
+        signame = signal.Signals(signum).name
+        print(f"[garden] received {signame}, shutting down...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _on_shutdown)
+    signal.signal(signal.SIGINT, _on_shutdown)
+
     # Inbox watcher rides along with the scheduler process: same dispatcher,
     # separate poll loop and worker pool so a slow inbox handler doesn't push
-    # cron fires off-clock. Daemon thread so it dies with the main loop.
+    # cron fires off-clock. Non-daemon so the process waits for it on shutdown.
     inbox = InboxWatcher(dispatcher, poll_interval=float(poll))
-    threading.Thread(target=inbox.run, name="garden-inbox", daemon=True).start()
-    Scheduler(dispatcher, poll_interval=float(poll)).run()
+    inbox_thread = threading.Thread(
+        target=inbox.run, args=(shutdown_event,), name="garden-inbox",
+    )
+    inbox_thread.start()
+
+    Scheduler(dispatcher, poll_interval=float(poll)).run(shutdown_event)
+
+    # Scheduler loop exited — inbox thread should also stop soon.
+    inbox_thread.join(timeout=15)
+    if inbox_thread.is_alive():
+        print("[garden] inbox thread did not stop within timeout")
     return 0
 
 

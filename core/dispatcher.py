@@ -83,6 +83,7 @@ class Dispatcher:
             _dispatch=self._dispatch_from_ctx,
             _services=self.services,
             _list_functions=self._list_functions_from_ctx,
+            _list_agents=self._list_agents_from_ctx,
         )
 
         try:
@@ -134,6 +135,16 @@ class Dispatcher:
         scope: Optional[str],
     ) -> Any:
         return self.call(qualified, params, parent_ctx=parent_ctx, scope=scope)
+
+    def _list_agents_from_ctx(self) -> list[dict]:
+        out: list[dict] = []
+        for name, manifest in sorted(self.registry.agents.items()):
+            out.append({
+                "name": name,
+                "description": manifest.description,
+                "function_count": len(manifest.functions),
+            })
+        return out
 
     def _list_functions_from_ctx(self, agent: Optional[str]) -> list[dict]:
         out: list[dict] = []
@@ -231,6 +242,7 @@ class Dispatcher:
             tuple(sandbox.extra_ro_binds),
             tuple(sandbox.extra_rw_binds),
             sandbox.timeout,
+            tuple(sandbox.can_call) if sandbox.can_call is not None else None,
             impl_mtime_ns,
         )
 

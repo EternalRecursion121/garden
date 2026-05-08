@@ -58,6 +58,10 @@ class InboxWatcher:
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="garden-inbox"
         )
+        # Per-recipient throttle bookkeeping. An agent with [agent.inbox]
+        # poll_interval = N gets its queue drained at most every N seconds;
+        # broadcasts ignore the throttle (would otherwise stall every agent).
+        self._last_checked: dict[str, float] = {}
 
     # public -------------------------------------------------------------
 
@@ -73,39 +77,67 @@ class InboxWatcher:
         if not undelivered:
             return 0
 
-        submitted = 0
+        # Group by recipient so a per-agent throttle drains all of that
+        # agent's pending mail in one go (matches "check inbox every N
+        # seconds" semantics) instead of releasing one message per window.
+        by_recipient: dict[str, list[dict]] = {}
         for msg in undelivered:
-            recipient = msg.get("to") or ""
-            subs = self.dispatcher.registry.inbox_subscribers_for(recipient)
-            if not subs:
-                # No handler for this recipient (yet). Leave delivered=false;
-                # a future tick after a manifest change will pick it up.
-                continue
+            by_recipient.setdefault(msg.get("to") or "", []).append(msg)
 
-            did = msg["did"]
-            try:
-                self.carry.assert_("garden.message", **{"this": did, "delivered": True})
-            except Exception as e:
-                print(f"[inbox] could not mark {did} delivered: {e}")
+        submitted = 0
+        for recipient, msgs in by_recipient.items():
+            if not self._may_process(recipient):
                 continue
+            for msg in msgs:
+                subs = self.dispatcher.registry.inbox_subscribers_for(recipient)
+                if not subs:
+                    # No handler for this recipient (yet). Leave delivered=false;
+                    # a future tick after a manifest change will pick it up.
+                    continue
 
-            params = {"message": _msg_payload(msg)}
-            for qualified, _fn in subs:
-                fut = self._executor.submit(self._dispatch, qualified, params)
-                self._track(qualified, fut)
-                submitted += 1
+                did = msg["did"]
+                try:
+                    self.carry.assert_("garden.message", **{"this": did, "delivered": True})
+                except Exception as e:
+                    print(f"[inbox] could not mark {did} delivered: {e}")
+                    continue
+
+                params = {"message": _msg_payload(msg)}
+                for qualified, _fn in subs:
+                    fut = self._executor.submit(self._dispatch, qualified, params)
+                    self._track(qualified, fut)
+                    submitted += 1
 
         return submitted
 
-    def run(self) -> None:
+    def _may_process(self, recipient: str) -> bool:
+        """Per-agent throttle. Broadcasts always pass through (otherwise one
+        slow agent would gate delivery to everyone). For named recipients,
+        respect `[agent.inbox] poll_interval` from the manifest."""
+        if not recipient or recipient == "broadcast":
+            return True
+        manifest = self.dispatcher.registry.agents.get(recipient)
+        if manifest is None or not manifest.inbox_poll_interval:
+            return True
+        now = time.monotonic()
+        last = self._last_checked.get(recipient, 0.0)
+        if now - last < manifest.inbox_poll_interval:
+            return False
+        self._last_checked[recipient] = now
+        return True
+
+    def run(self, shutdown_event: Optional[threading.Event] = None) -> None:
         print(f"[inbox] starting; poll={self.poll_interval}s")
         try:
-            while True:
+            while not (shutdown_event and shutdown_event.is_set()):
                 try:
                     self.tick()
                 except Exception as e:
                     print(f"[inbox] tick failed: {e}")
-                time.sleep(self.poll_interval)
+                if shutdown_event is not None:
+                    shutdown_event.wait(timeout=self.poll_interval)
+                else:
+                    time.sleep(self.poll_interval)
         finally:
             self._executor.shutdown(wait=False, cancel_futures=True)
 

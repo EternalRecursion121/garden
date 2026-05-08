@@ -1,26 +1,27 @@
 """Note + message helpers backed by carry.
 
-Two domains, two scopes, one substrate:
+Two domains, one shared substrate:
 
   garden.note      durable knowledge (replaces markdown vaults)
-    fields: scope ("personal"|"shared"), agent, title (optional, used for
-            wikilinks), body (markdown), tags, created-at, source
+    fields: agent, title (optional, used for wikilinks), body (markdown),
+            tags, created-at, source
 
   garden.message   asynchronous inter-agent communication
     fields: from, to ("<agent>" or "broadcast"), subject, body, in-reply-to,
             delivered (set true once the recipient processes it), created-at
 
-Identity comes from `ctx.agent` — set by the dispatcher when it calls into
-your function. You don't pass `agent=` / `reader=` / `sender=` / `recipient=`
-yourself: the helpers read it off ctx so you can't accidentally (or
-maliciously) write notes claiming to be another agent or read another
-agent's "personal" notes through these helpers.
+Notes are shared: every agent sees every note. Agents that want truly
+private state should keep it in their own folder (`agents/<name>/...`),
+not in carry. Identity comes from `ctx.agent` — set by the dispatcher
+when it calls into your function. You don't pass `agent=` / `sender=` /
+`recipient=` yourself: the helpers read it off ctx so you can't
+accidentally (or maliciously) write notes or messages claiming to be
+another agent.
 
 Caveat: the carry CLI itself is not ACL'd. An agent that bypasses these
 helpers and shells out to `carry assert garden.note agent=other-agent ...`
-can still forge claims. Treat per-agent scoping in carry as a discipline,
-not a security boundary; agents you don't trust shouldn't share a carry
-repo.
+can still forge claims. Treat agent attribution as a discipline, not a
+security boundary; agents you don't trust shouldn't share a carry repo.
 
 Wikilinks
 ---------
@@ -62,23 +63,20 @@ def write_note(
     ctx,
     *,
     body: str,
-    scope: str = "personal",
     tags: list[str] | None = None,
     source: str | None = None,
     title: str | None = None,
 ) -> str:
-    """Add a note attributed to the running agent (`ctx.agent`).
+    """Add a note attributed to the running agent (`ctx.agent`). All notes
+    are shared — every agent sees every note. Keep private scratch in the
+    agent's own folder if you don't want others reading it.
 
-    `scope`: "personal" (only this agent reads via these helpers) or "shared".
     `tags`: optional list of strings for categorisation.
     `source`: where this note came from (vault filename, dream id, …).
     `title`: optional human-readable title; required for wikilink targets.
     """
-    if scope not in ("personal", "shared"):
-        raise ValueError(f"scope must be 'personal' or 'shared', got {scope!r}")
     return carry.assert_(
         "garden.note",
-        scope=scope,
         agent=_agent_of(ctx),
         title=title or "",
         body=body,
@@ -94,12 +92,11 @@ def list_notes(
     *,
     tag: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return notes the running agent can see: their own personal notes plus
-    all shared notes. Optionally filtered by tag."""
+    """Return all notes (every agent's), optionally filtered by tag."""
     rows = carry.query(
-        "garden.note", "scope", "agent", "title", "body", "tags", "source", "created-at"
+        "garden.note", "agent", "title", "body", "tags", "source", "created-at"
     )
-    return _filter_notes(rows or {}, reader=_agent_of(ctx), tag=tag)
+    return _filter_notes(rows or {}, tag=tag)
 
 
 # --- Wikilink navigation ------------------------------------------------
@@ -107,8 +104,7 @@ def list_notes(
 
 def follow_link(carry: Carry, ctx, *, title: str) -> dict[str, Any] | None:
     """Resolve a `[[Title]]` reference. Returns the matching note (newest if
-    multiple share a title), respecting the running agent's scope. None if
-    no match is visible."""
+    multiple share a title). None if no note with that title exists."""
     matches = [
         n for n in list_notes(carry, ctx)
         if (n.get("title") or "").strip().lower() == title.strip().lower()
@@ -247,16 +243,11 @@ def _now() -> float:
 def _filter_notes(
     rows: dict[str, Any],
     *,
-    reader: str,
     tag: str | None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for did, fields in rows.items():
         n = fields.get("garden.note", {})
-        scope = n.get("scope", "personal")
-        agent = n.get("agent", "")
-        if scope == "personal" and agent != reader:
-            continue
         if tag is not None and tag not in (n.get("tags") or []):
             continue
         out.append({"did": did, **n})

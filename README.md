@@ -17,7 +17,7 @@ Garden is opinionated about plumbing. It is **not** opinionated about what agent
 - **Inbound gateways** — long-running event sources that turn outside events into dispatcher calls. Currently: **Discord** (channel-subscription routing). Add more under `core/gateways/`.
 - **Outbound services** — gateways register themselves on the dispatcher; functions reach them via `ctx.service("discord")`.
 - **Per-call sandboxing** — `bwrap` isolation **on by default** for every agent, with file-level overrides for self-modification (e.g. an agent's identity doc bound writable while the rest of its folder stays read-only). Sandbox env is scrubbed; agents declare which env vars they need.
-- **Carry-backed knowledge store** — one shared CRDT-merge-safe repo at `data/.carry/`. Helpers in `utils/notes.py` for `note` (durable knowledge with personal/shared scope and `[[wikilink]]` navigation) and `message` (inter-agent comms).
+- **Carry-backed knowledge store** — one shared CRDT-merge-safe repo at `data/.carry/`. Helpers in `utils/notes.py` for `note` (durable shared knowledge with `[[wikilink]]` navigation) and `message` (inter-agent comms).
 
 ---
 
@@ -117,9 +117,9 @@ sandbox     = false                     # optional override of agent-level setti
 - **Env is scrubbed (`--clearenv`).** Only `PATH`, `HOME` (= scratch dir), `LANG`, `PYTHONPATH`, `GARDEN_ROOT`, `GARDEN_AGENT_SCRATCH` are set. Anything else (API keys, `DISCORD_TOKEN`, etc.) only reaches the sandbox if the manifest lists it in `env_passthrough`.
 - `extra_ro_binds` / `extra_rw_binds` are validated: absolute, no `..`, and not equal to `/`, `/etc`, `/proc`, `/sys`, `/dev`, `/root`, `/home`, `/var`, `/run`, `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/boot`. Pick a more specific subdir.
 - Each call has a `timeout` (default 300s; per-function `timeout = N` overrides).
-- Inside the sandbox `ctx.call()` and `ctx.map()` raise; `ctx.service(...)` returns None. Sandboxed functions are leaves and reach Discord only via return-value protocol (a `{reply: "..."}` dict picked up by the gateway).
+- Inside the sandbox `ctx.call()` / `ctx.map()` / `ctx.list_functions()` round-trip to the parent via stdin/stdout JSON-RPC — cross-agent dispatch works from sandboxed code. RPC requests serialise on a single channel, so `ctx.map` from inside the sandbox is sequential, not parallel. Cross-agent reach can be restricted with `[agent.sandbox] can_call = ["kira.consult", "tilth.*"]` (field absent ⇒ allow all; `can_call = []` ⇒ deny all). `ctx.service(...)` returns None — live handles like the Discord client aren't proxyable across the sandbox boundary, so sandboxed functions reach Discord only via the return-value protocol (a `{reply: "..."}` dict picked up by the gateway).
 
-Functions that need cross-agent dispatch or live service handles should set `sandbox = false` in their manifest entry.
+Functions that need live service handles (e.g. proactive `ctx.service("discord").send(...)` calls) should set `sandbox = false` in their manifest entry.
 
 ### Discord gateway config
 
@@ -139,7 +139,7 @@ dedup_ttl        = 300
 
 The runtime treats `agent.toml` as trusted code — the runtime owner is expected to read an agent's manifest before installing it. The forbidden-bind list and env scrubbing make accidental escalation harder, but a malicious manifest can still set `sandbox = false`, and a non-sandboxed `command = […]` runs as the gateway user with full access. Don't drop in agents you haven't reviewed.
 
-Carry-level scoping (`personal` notes, message recipients) is enforced through the helpers in `utils/notes.py` (which derive identity from `ctx.agent`), but the carry CLI itself is not ACL'd. An agent that bypasses the helpers and writes claims directly can forge `agent`/`from`/`to` fields. Treat per-agent scoping in carry as a discipline, not a security boundary; agents you don't fully trust shouldn't share a carry repo.
+Notes are shared — every agent reads every note. Agent attribution (`agent` on notes, `from`/`to` on messages) is set by the `utils/notes.py` helpers from `ctx.agent`, but the carry CLI itself is not ACL'd: an agent that bypasses the helpers and writes claims directly can forge those fields. Treat agent attribution as a discipline, not a security boundary; agents you don't fully trust shouldn't share a carry repo. If an agent needs truly private state, keep it in its own folder, not in carry.
 
 ---
 
@@ -147,7 +147,7 @@ Carry-level scoping (`personal` notes, message recipients) is enforced through t
 
 Two domains, one repo:
 
-- **`garden.note`** — durable knowledge. Each note has `scope` (`personal` filtered by agent, or `shared`), an optional `title` (for `[[wikilink]]` references), `body`, `tags`, `source`, `created-at`. Use `utils.notes.write_note`, `list_notes`, `follow_link`, `expand_links`. Identity (`agent`/`reader`) is derived from `ctx.agent` — you don't pass it.
+- **`garden.note`** — durable shared knowledge. Each note has `agent` (author), an optional `title` (for `[[wikilink]]` references), `body`, `tags`, `source`, `created-at`. Use `utils.notes.write_note`, `list_notes`, `follow_link`, `expand_links`. The author's `agent` is derived from `ctx.agent` — you don't pass it. All notes are visible to all agents; keep private scratch in the agent's own folder.
 - **`garden.message`** — async inter-agent communication. Each message has `from`, `to` (an agent name or `"broadcast"`), `subject`, `body`, optional `in-reply-to`, and a `delivered` flag the recipient flips after processing. Use `send_message`, `fetch_inbox`, `mark_delivered`. `from`/`recipient` come from `ctx.agent`; `mark_delivered` refuses to flip a message not addressed to the running agent.
 
 Because everything sits in carry, two sandboxed agents can write the same store concurrently and CRDT-merge cleanly.

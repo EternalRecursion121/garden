@@ -14,6 +14,7 @@ To configure (defaults shown):
     extra_ro_binds  = ["/some/host/path"]
     extra_rw_binds  = []
     timeout         = 300                         # seconds; 0 disables
+    can_call        = ["kira.consult", "tilth.*"] # see "Cross-agent calls"
 
 Each call spawns a fresh `bwrap` invocation that:
   * binds garden's `core/` and `utils/` read-only,
@@ -30,16 +31,35 @@ Each call spawns a fresh `bwrap` invocation that:
     `env_passthrough`,
   * runs Python (`sys.executable`) inside, executing `core.sandbox`'s harness.
 
-The harness imports the impl, calls it with params, and writes the JSON
-result back over a dedicated fd. We dup fd 1 before user code runs and
-redirect stdout to stderr, so user `print()`s can't corrupt the result
-envelope. Inside the sandbox, `ctx.call` is disabled (we'd need a stdin
-RPC channel back to the parent) and `ctx.service(...)` returns None.
+The harness imports the impl, calls it with params, and exchanges JSON-RPC
+messages with the parent over stdin/stdout. We dup fd 1 before user code
+runs and redirect stdout to stderr, so user `print()`s can't corrupt the
+RPC stream — only the harness writes to the saved fd, and only as
+newline-delimited JSON. `ctx.service(...)` still returns None inside the
+sandbox (live service handles aren't proxyable).
 
-Constraints implied by this:
-  * sandboxed functions are leaves — they don't fan out via ctx.call/map.
-  * sandboxed functions get no live discord/etc service handles.
-  * carry is the one shared write surface (CRDT-merge-safe by design).
+Cross-agent calls
+-----------------
+`ctx.call` and `ctx.map` work inside the sandbox via RPC back to the
+parent dispatcher; the dispatched call runs unsandboxed in the parent's
+process (or sandboxed if the *target* agent declares it). `ctx.list_functions`
+also RPCs back to read the live registry. Parallel `ctx.map` requests
+serialise on the RPC channel — the call still happens, just one at a time.
+
+Sandboxed agents can restrict which siblings they're allowed to call:
+
+    [agent.sandbox]
+    can_call = ["kira.consult", "tilth.*"]   # only these targets
+    can_call = []                            # deny all cross-agent calls
+    # (field absent)                         # allow all (default)
+
+Patterns are exact `agent.fn` or `agent.*` (any function in that agent).
+
+Constraints that still apply:
+  * sandboxed functions get no live discord/etc service handles
+    (`ctx.service(...)` returns None).
+  * carry is still the shared write surface; cross-agent calls add
+    request/response RPC on top.
 """
 
 from __future__ import annotations
@@ -49,10 +69,12 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 # --- config --------------------------------------------------------------
@@ -85,6 +107,18 @@ def _validate_extra_bind(p: str, kind: str) -> str:
     return norm
 
 
+def _validate_can_call_pattern(p: str) -> str:
+    if not isinstance(p, str) or not p:
+        raise ValueError("can_call entry must be a non-empty string")
+    # Either "agent.fn" or "agent.*". Reject anything else.
+    parts = p.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(
+            f"can_call {p!r} must be 'agent.fn' or 'agent.*'"
+        )
+    return p
+
+
 @dataclass
 class SandboxConfig:
     enabled: bool = True
@@ -99,6 +133,11 @@ class SandboxConfig:
     extra_rw_binds: list[str] = field(default_factory=list)
     # Hard cap on a single sandboxed call. 0 disables.
     timeout: float = 300.0
+    # Cross-agent call allowlist. None = unrestricted (default); [] = deny
+    # all; ["kira.consult", "tilth.*"] = only those targets. Patterns are
+    # exact qualified names or "agent.*" globs. Enforced by the parent
+    # dispatcher when a sandboxed function issues an RPC `call` request.
+    can_call: Optional[list[str]] = None
 
     @classmethod
     def parse(cls, table: Any) -> "SandboxConfig":
@@ -109,6 +148,16 @@ class SandboxConfig:
             return cls()
         if not isinstance(table, dict):
             raise ValueError("[agent.sandbox] must be a table")
+        # `can_call` is None when absent, list (possibly empty) when set.
+        # This three-state distinction matters: missing = allow all,
+        # `can_call = []` = deny all.
+        raw_can_call = table.get("can_call", None)
+        if raw_can_call is None:
+            can_call: Optional[list[str]] = None
+        else:
+            if not isinstance(raw_can_call, list):
+                raise ValueError("can_call must be a list of patterns")
+            can_call = [_validate_can_call_pattern(str(s)) for s in raw_can_call]
         return cls(
             enabled=bool(table.get("enabled", True)),
             network=bool(table.get("network", False)),
@@ -122,7 +171,24 @@ class SandboxConfig:
                 for p in table.get("extra_rw_binds", [])
             ],
             timeout=float(table.get("timeout", 300.0)),
+            can_call=can_call,
         )
+
+
+def can_call_matches(can_call: Optional[list[str]], qualified: str) -> bool:
+    """Check whether `qualified` is permitted under a `can_call` allowlist.
+
+    None  → unrestricted (allow). [] → deny everything. Otherwise the
+    qualified name must match an exact entry or an "agent.*" glob.
+    """
+    if can_call is None:
+        return True
+    for pattern in can_call:
+        if pattern == qualified:
+            return True
+        if pattern.endswith(".*") and qualified.startswith(pattern[:-1]):
+            return True
+    return False
 
 
 # --- argv builder --------------------------------------------------------
@@ -214,6 +280,13 @@ def build_bwrap_argv(
         "--ro-bind", str(agent_folder), str(agent_folder),
     ]
 
+    # Runtime docs, if present. Optional — gardens without `docs/` skip it.
+    # Bound RO so any agent (not just `garden.help`) can read reference
+    # material at runtime without copying it into its own folder.
+    docs_dir = garden_root / "docs"
+    if docs_dir.is_dir():
+        argv += ["--ro-bind", str(docs_dir), str(docs_dir)]
+
     # Writable: scratch + carry repo (if it exists)
     argv += ["--bind", str(scratch_dir), str(scratch_dir)]
     if carry_dir.exists():
@@ -292,6 +365,8 @@ def make_sandboxed_python_impl(
     # Per-function `timeout` overrides agent-level `[agent.sandbox].timeout`.
     timeout = fn.timeout if fn.timeout is not None else (cfg.timeout if cfg.timeout > 0 else None)
 
+    can_call = cfg.can_call
+
     def impl(params: dict, ctx) -> Any:
         bwrap_argv = build_bwrap_argv(garden_root, agent_root, scratch_dir, cfg)
         cmd = bwrap_argv + [
@@ -300,7 +375,7 @@ def make_sandboxed_python_impl(
             "--impl", f"{impl_path}:{func_name}",
             "--agent-root", str(agent_root),
         ]
-        payload = json.dumps({
+        envelope = json.dumps({
             "params": params,
             "ctx": {
                 "agent": manifest.name,
@@ -310,37 +385,167 @@ def make_sandboxed_python_impl(
                 "depth": ctx.depth,
             },
         })
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # line-buffered
+        )
+
+        # Drain stderr in a thread so the child can never block on a full
+        # pipe. We accumulate it for inclusion in error messages.
+        stderr_chunks: list[str] = []
+
+        def drain_stderr() -> None:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_chunks.append(line)
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        deadline = time.monotonic() + timeout if timeout else None
+
+        def _kill_and_raise(reason: str) -> "RuntimeError":
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+            stderr_thread.join(timeout=1)
+            return RuntimeError(reason)
+
+        # Send the initial envelope.
+        assert proc.stdin is not None and proc.stdout is not None
         try:
-            proc = subprocess.run(
-                cmd, input=payload, capture_output=True, text=True,
-                check=False, timeout=timeout,
+            proc.stdin.write(envelope + "\n")
+            proc.stdin.flush()
+        except BrokenPipeError as e:
+            raise _kill_and_raise(
+                f"sandbox closed stdin before reading envelope: stderr={''.join(stderr_chunks)!r}"
+            ) from e
+
+        final: dict[str, Any] | None = None
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                raise _kill_and_raise(f"sandbox timed out after {timeout}s")
+
+            line = proc.stdout.readline()
+            if not line:
+                # Child closed the channel without a final result.
+                break
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                # Stray non-JSON line on the result fd shouldn't happen — the
+                # harness redirects user prints to stderr — but be defensive.
+                continue
+
+            op = msg.get("op")
+            if op == "result":
+                final = {"result": msg.get("result")}
+                break
+            if op == "error":
+                final = {"error": msg.get("error", {})}
+                break
+
+            # RPC requests from the child.
+            req_id = msg.get("id")
+            if op == "call":
+                qualified = msg.get("qualified", "")
+                call_params = msg.get("params") or {}
+                call_scope = msg.get("scope")
+                if not can_call_matches(can_call, qualified):
+                    resp: dict[str, Any] = {
+                        "id": req_id,
+                        "ok": False,
+                        "error": {
+                            "type": "PermissionError",
+                            "message": (
+                                f"sandboxed agent {manifest.name!r} not permitted "
+                                f"to call {qualified!r}; add it to "
+                                f"[agent.sandbox] can_call to allow."
+                            ),
+                        },
+                    }
+                else:
+                    try:
+                        value = ctx.call(qualified, call_params, scope=call_scope)
+                        resp = {"id": req_id, "ok": True, "value": value}
+                    except Exception as e:
+                        resp = {
+                            "id": req_id,
+                            "ok": False,
+                            "error": {"type": type(e).__name__, "message": str(e)},
+                        }
+            elif op == "list_functions":
+                try:
+                    value = ctx.list_functions(msg.get("agent"))
+                    resp = {"id": req_id, "ok": True, "value": value}
+                except Exception as e:
+                    resp = {
+                        "id": req_id,
+                        "ok": False,
+                        "error": {"type": type(e).__name__, "message": str(e)},
+                    }
+            elif op == "list_agents":
+                try:
+                    value = ctx.list_agents()
+                    resp = {"id": req_id, "ok": True, "value": value}
+                except Exception as e:
+                    resp = {
+                        "id": req_id,
+                        "ok": False,
+                        "error": {"type": type(e).__name__, "message": str(e)},
+                    }
+            else:
+                resp = {
+                    "id": req_id,
+                    "ok": False,
+                    "error": {"type": "ProtocolError", "message": f"unknown op {op!r}"},
+                }
+
+            try:
+                proc.stdin.write(json.dumps(resp, default=str) + "\n")
+                proc.stdin.flush()
+            except BrokenPipeError:
+                # Child died between request and response; loop will exit
+                # on next readline returning empty.
+                break
+
+        # Wait for child to exit and stderr drain to finish.
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            raise _kill_and_raise(
+                f"sandbox didn't exit after final result: "
+                f"stderr={''.join(stderr_chunks)!r}"
             )
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError(f"sandbox timed out after {timeout}s") from e
-        # Try the error envelope first: the runner writes diagnostics to its
-        # original stdout (now `result_fd`) even on exception paths, then
-        # exits non-zero. Surfacing that beats reporting an empty stderr.
-        envelope = None
-        try:
-            envelope = json.loads(proc.stdout) if proc.stdout else None
-        except json.JSONDecodeError:
-            envelope = None
-        if envelope and envelope.get("error"):
+        stderr_thread.join(timeout=1)
+
+        stderr_text = "".join(stderr_chunks).strip()
+
+        if final and "error" in final:
+            err = final["error"] or {}
             raise RuntimeError(
-                f"{envelope['error']['type']}: {envelope['error']['message']}\n"
-                f"{envelope['error'].get('traceback', '')}"
+                f"{err.get('type', 'SandboxError')}: {err.get('message', '')}\n"
+                f"{err.get('traceback', '')}"
             )
         if proc.returncode != 0:
             raise RuntimeError(
-                f"sandbox exited {proc.returncode}: "
-                f"stderr={proc.stderr.strip()!r} stdout={proc.stdout.strip()!r}"
+                f"sandbox exited {proc.returncode}: stderr={stderr_text!r}"
             )
-        if envelope is None:
+        if final is None:
             raise RuntimeError(
-                f"sandbox produced non-JSON output: "
-                f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+                f"sandbox produced no result envelope: stderr={stderr_text!r}"
             )
-        return envelope.get("result")
+        return final.get("result")
 
     return impl
 
@@ -395,12 +600,61 @@ def make_sandboxed_command_impl(
 # --- in-sandbox harness --------------------------------------------------
 
 
+class _SandboxRPCError(RuntimeError):
+    """Raised when an RPC the child issued fails on the parent side."""
+
+
+class _SandboxRPCClient:
+    """Issues request/response RPCs from the sandboxed child to the parent.
+
+    The protocol is newline-delimited JSON:
+      child → parent (via the saved fd 1):  {"op": "...", "id": "...", ...}
+      parent → child (via stdin):           {"id": "...", "ok": bool, ...}
+
+    A lock serialises concurrent callers (e.g. ctx.map fan-out): the
+    channel is single-stream, so requests run one at a time. That's
+    fine for correctness — the parent still parallelises if it wants to.
+    """
+
+    def __init__(self, write_line: Callable[[dict], None], stdin) -> None:
+        self._write_line = write_line
+        self._stdin = stdin
+        self._next_id = 0
+        self._lock = threading.Lock()
+
+    def request(self, op: str, **payload: Any) -> Any:
+        with self._lock:
+            self._next_id += 1
+            req_id = str(self._next_id)
+            self._write_line({"op": op, "id": req_id, **payload})
+            line = self._stdin.readline()
+            if not line:
+                raise _SandboxRPCError(
+                    "sandbox parent closed RPC channel before responding"
+                )
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise _SandboxRPCError(f"bad RPC response from parent: {e}")
+            if resp.get("id") != req_id:
+                raise _SandboxRPCError(
+                    f"RPC id mismatch: got {resp.get('id')!r}, expected {req_id!r}"
+                )
+            if not resp.get("ok"):
+                err = resp.get("error", {})
+                raise _SandboxRPCError(
+                    f"{err.get('type', 'CallError')}: {err.get('message', 'unknown')}"
+                )
+            return resp.get("value")
+
+
 class _SandboxedContext:
     """Lightweight ctx exposed to functions inside the sandbox.
 
-    Cross-agent dispatch and live services are unavailable here — those
-    require IPC back to the parent process which we deliberately don't
-    plumb in v1. Functions that need them shouldn't be sandboxed.
+    `call`, `map`, and `list_functions` round-trip to the parent over
+    stdin/stdout RPC. `service(...)` still returns None because live
+    service handles (Discord client, etc.) aren't proxyable across the
+    sandbox boundary.
     """
 
     def __init__(
@@ -410,40 +664,71 @@ class _SandboxedContext:
         parent_run_id: str | None,
         scope: str | None,
         depth: int,
+        rpc: _SandboxRPCClient,
     ):
         self.agent = agent
         self.run_id = run_id
         self.parent_run_id = parent_run_id
         self.scope = scope
         self.depth = depth
+        self._rpc = rpc
 
-    def call(self, *args, **kwargs):
-        raise RuntimeError(
-            "ctx.call() is unavailable inside a sandboxed function. "
-            "Disable sandboxing for this agent or split the function."
+    def call(
+        self,
+        qualified: str,
+        params: dict | None = None,
+        scope: str | None = None,
+    ) -> Any:
+        return self._rpc.request(
+            "call",
+            qualified=qualified,
+            params=params or {},
+            scope=scope,
         )
 
-    def map(self, *args, **kwargs):
-        raise RuntimeError(
-            "ctx.map() is unavailable inside a sandboxed function."
-        )
+    def map(
+        self,
+        qualified: str,
+        params_list: list[dict],
+        scope_fn: Callable[[dict], str] | None = None,
+        max_workers: int = 8,  # noqa: ARG002 — kept for API parity
+    ) -> list[Any]:
+        # Sandbox RPC channel is single-stream; serialise here. The parent
+        # could parallelise if it wanted, but unless we add request
+        # multiplexing the wire is one-at-a-time.
+        return [
+            self.call(qualified, p, scope=(scope_fn(p) if scope_fn else None))
+            for p in params_list
+        ]
 
     def service(self, name: str):
         return None
 
     def list_functions(self, agent: str | None = None) -> list[dict]:
-        # No registry IPC inside the sandbox.
-        return []
+        return self._rpc.request("list_functions", agent=agent)
+
+    def list_agents(self) -> list[dict]:
+        return self._rpc.request("list_agents")
 
 
 def _runner_main() -> int:
-    """Entry point for `python -m core.sandbox`. Reads JSON from stdin,
-    invokes the requested impl, writes a JSON envelope to a dedicated fd.
+    """Entry point for `python -m core.sandbox`. Speaks JSON-RPC over
+    stdin/stdout with the parent process.
 
-    To prevent user `print()`s in the impl from corrupting the JSON output,
-    we save fd 1 into `result_fd` first, then redirect stdout to stderr.
-    User prints flow to the parent's captured stderr (visible for debugging);
-    only the harness writes the envelope, and only via `result_fd`.
+    Wire protocol (newline-delimited JSON, one message per line):
+
+        parent → child (stdin):
+            first line:  {"params": {...}, "ctx": {...}}
+            then:        {"id": "...", "ok": bool, "value": ...}   # RPC response
+
+        child → parent (saved fd 1):
+            during run:  {"op": "call"|"list_functions"|"list_agents", "id": "...", ...}
+            at end:      {"op": "result", "result": ...}
+                     or  {"op": "error", "error": {"type", "message", "traceback"}}
+
+    Stdout fd 1 is dup'd into `result_fd` first, then fd 1 is repointed
+    at fd 2 so user `print()` calls flow to stderr. Only this harness
+    writes to `result_fd`, so the RPC stream stays clean.
     """
     import argparse, importlib.util
 
@@ -451,33 +736,43 @@ def _runner_main() -> int:
     result_fd = os.dup(1)
     os.dup2(2, 1)
     sys.stdout = os.fdopen(1, "w", buffering=1)
+    result_writer = os.fdopen(result_fd, "w", buffering=1)
 
-    def emit(envelope: dict[str, Any]) -> None:
-        os.write(result_fd, json.dumps(envelope, default=str).encode())
+    write_lock = threading.Lock()
+
+    def write_line(msg: dict[str, Any]) -> None:
+        # Single writer in practice (the impl thread), but guard anyway —
+        # the RPC client's own lock already serialises requests, and the
+        # final result/error emit happens after the impl returns.
+        with write_lock:
+            result_writer.write(json.dumps(msg, default=str) + "\n")
+            result_writer.flush()
 
     def emit_error(typ: str, msg: str, tb: str) -> None:
-        emit({"error": {"type": typ, "message": msg, "traceback": tb}})
+        write_line({"op": "error", "error": {"type": typ, "message": msg, "traceback": tb}})
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--impl", required=True, help="absolute/path.py:function")
     parser.add_argument("--agent-root", default="", help="absolute agent folder")
     args = parser.parse_args()
 
-    raw = sys.stdin.read()
+    raw = sys.stdin.readline()
     try:
         msg = json.loads(raw or "{}")
     except json.JSONDecodeError as e:
-        emit_error("BadInput", f"could not parse stdin: {e}", "")
+        emit_error("BadInput", f"could not parse stdin envelope: {e}", "")
         return 2
 
     params = msg.get("params", {})
     ctx_d = msg.get("ctx", {})
+    rpc = _SandboxRPCClient(write_line, sys.stdin)
     ctx = _SandboxedContext(
         agent=ctx_d.get("agent", ""),
         run_id=ctx_d.get("run_id", ""),
         parent_run_id=ctx_d.get("parent_run_id"),
         scope=ctx_d.get("scope"),
         depth=int(ctx_d.get("depth", 0)),
+        rpc=rpc,
     )
 
     impl_arg = args.impl
@@ -514,7 +809,7 @@ def _runner_main() -> int:
         emit_error(type(e).__name__, str(e), traceback.format_exc())
         return 1
 
-    emit({"result": result})
+    write_line({"op": "result", "result": result})
     return 0
 
 

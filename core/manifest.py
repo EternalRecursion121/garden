@@ -117,6 +117,7 @@ class AgentManifest:
     description: str = ""
     functions: dict[str, FunctionDef] = field(default_factory=dict)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    inbox_poll_interval: float | None = None  # seconds; throttles per-agent inbox processing
 
     @classmethod
     def load(cls, agent_dir: Path) -> "AgentManifest":
@@ -130,6 +131,20 @@ class AgentManifest:
         # (enabled, network off, no env passthrough). Explicit `enabled = false`
         # returns a config whose `.enabled` is False.
         sandbox = SandboxConfig.parse(agent.get("sandbox"))
+
+        inbox_cfg = agent.get("inbox") or {}
+        if not isinstance(inbox_cfg, dict):
+            raise ValueError(
+                f"{manifest_path}: [agent.inbox] must be a table, got {type(inbox_cfg).__name__}"
+            )
+        inbox_poll = inbox_cfg.get("poll_interval")
+        if inbox_poll is not None:
+            if not isinstance(inbox_poll, (int, float)) or isinstance(inbox_poll, bool) or inbox_poll <= 0:
+                raise ValueError(
+                    f"{manifest_path}: [agent.inbox] poll_interval must be a positive "
+                    f"number, got {inbox_poll!r}"
+                )
+            inbox_poll = float(inbox_poll)
 
         functions: dict[str, FunctionDef] = {}
         for entry in data.get("function", []):
@@ -169,4 +184,5 @@ class AgentManifest:
             description=agent.get("description", ""),
             functions=functions,
             sandbox=sandbox,
+            inbox_poll_interval=inbox_poll,
         )

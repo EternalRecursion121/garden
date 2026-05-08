@@ -1,0 +1,24 @@
+[agent]
+name = "garden"
+description = "Runtime help. Reads docs/*.md and serves them to other agents on request."
+
+# Sandbox is fine: this only reads files. The runtime binds the repo's
+# docs/ dir RO into every sandbox by default (see core/sandbox.py).
+[agent.sandbox]
+enabled = true
+network = false
+timeout = 30
+# Doesn't need to call anyone; just reads files.
+can_call = []
+
+[[function]]
+name        = "help"
+description = "Return a runtime doc as markdown. Pass topic='ctx'|'sandbox'|'carry'|'messaging'; omit for the table of contents."
+impl        = "help.py:run"
+params      = { topic = "string?" }
+
+[[function]]
+name        = "topics"
+description = "List available help topics."
+impl        = "help.py:topics"
+params      = {}

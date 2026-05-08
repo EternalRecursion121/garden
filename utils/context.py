@@ -29,6 +29,7 @@ class Context:
     _dispatch: Callable[..., Any] = None  # (qualified, params, parent_ctx, scope) -> Any
     _services: dict[str, Any] = field(default_factory=dict)
     _list_functions: Callable[[Optional[str]], list[dict]] = None
+    _list_agents: Callable[[], list[dict]] = None
 
     def list_functions(self, agent: str | None = None) -> list[dict]:
         """Discover what other functions exist in the garden.
@@ -41,6 +42,17 @@ class Context:
         if self._list_functions is None:
             return []
         return self._list_functions(agent)
+
+    def list_agents(self) -> list[dict]:
+        """Discover which agents exist in the garden.
+
+        Returns one dict per registered agent with keys: `name`,
+        `description`, `function_count`. Use `list_functions(agent=...)`
+        to drill into a specific namespace.
+        """
+        if self._list_agents is None:
+            return []
+        return self._list_agents()
 
     def service(self, name: str) -> Any | None:
         """Return a registered runtime service or None if not running.

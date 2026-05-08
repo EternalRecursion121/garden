@@ -120,14 +120,18 @@ class Scheduler:
         # doesn't busy-loop; cap so newly-added schedules still get noticed.
         return max(0.1, min(wait, self.poll_interval))
 
-    def run(self) -> None:
+    def run(self, shutdown_event: Optional[threading.Event] = None) -> None:
         print(
             f"[scheduler] starting; poll<={self.poll_interval}s, "
             f"workers={self._executor._max_workers}"
         )
         try:
-            while True:
+            while not (shutdown_event and shutdown_event.is_set()):
                 self.tick()
-                time.sleep(self._sleep_for())
+                wait = self._sleep_for()
+                if shutdown_event is not None:
+                    shutdown_event.wait(timeout=wait)
+                else:
+                    time.sleep(wait)
         finally:
             self._executor.shutdown(wait=False, cancel_futures=True)
